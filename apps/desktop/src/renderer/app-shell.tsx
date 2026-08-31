@@ -826,6 +826,7 @@ function AppShellContent({
     [sessions, onboarding.snapshot?.sessionSendOutcomes],
   );
   const activeInteraction = activeInteractionFor(interactionBySession, ownerActiveId);
+  const activeForm = activeInteraction?.type === 'form_request' ? activeInteraction : undefined;
   const activeSession = activeCatalogSession;
   const sessionSettingIntent = useSessionSettingIntent({
     catalogRevision,
@@ -1794,6 +1795,7 @@ function AppShellContent({
     enqueueMessage,
     respondToSandboxBoundary,
     respondToUserQuestion,
+    respondToUserForm,
     refreshMessages,
     retryMessages,
   } = useStableActions(createAppShellChatActions, {
@@ -2934,6 +2936,8 @@ function AppShellContent({
                   respondToSandboxBoundary={respondToSandboxBoundary}
                   respondToClientCapability={workbar.commands.respondToClientCapability}
                   respondToUserQuestion={respondToUserQuestion}
+                  activeForm={activeForm}
+                  respondToUserForm={respondToUserForm}
                   stop={stop}
                   directoryComposerProps={directoryComposerProps}
                   directoryPickerEnabled={!!(
