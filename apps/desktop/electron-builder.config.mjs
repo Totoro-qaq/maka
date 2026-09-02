@@ -262,6 +262,13 @@ const baseDesktopBuilderConfig = {
   },
   win: {
     artifactName: 'Maka-${version}-win-${arch}.${ext}',
+    // node-gyp leaves checkout-specific projects and link intermediates here.
+    // Only the native addons and their ConPTY DLL/helper are used at runtime.
+    files: [
+      '!**/node_modules/node-pty/build/!(Release){,/**}',
+      '!**/node_modules/node-pty/build/Release/!(*.node|conpty){,/**}',
+      '!**/node_modules/node-pty/node-addon-api{,/**}',
+    ],
     // Same reason as `mac.icon` above: the .exe, the installer and the
     // shortcut are drawn by the OS from this file, not by us.
     icon: 'assets/app-icons/sky.png',

@@ -20,14 +20,72 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { after, describe, test } from 'node:test';
 import { createPackage } from '@electron/asar';
+import { FileMatcher, getNodeModuleFileMatcher } from 'app-builder-lib/out/fileMatcher.js';
+import { NodeModuleCopyHelper } from 'app-builder-lib/out/util/NodeModuleCopyHelper.js';
+import { resolveDesktopBuilderConfig } from '../apps/desktop/electron-builder.config.mjs';
 import {
   asarLookupPath,
   assertPackagedDependencyClosure,
   assertPackagedResources,
 } from './verify-packaged-app.mjs';
+
+test('Windows packaging keeps node-pty runtime files without its build intermediates', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'maka-pty-package-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const moduleRoot = join(root, 'node_modules', 'node-pty');
+  const runtimeFiles = [
+    'package.json',
+    'LICENSE',
+    'lib/index.js',
+    'lib/worker/conoutSocketWorker.js',
+    'build/Release/conpty.node',
+    'build/Release/conpty_console_list.node',
+    'build/Release/conpty/conpty.dll',
+    'build/Release/conpty/OpenConsole.exe',
+    'prebuilds/win32-x64/conpty.node',
+    'prebuilds/win32-x64/conpty/conpty.dll',
+    'prebuilds/win32-x64/conpty/OpenConsole.exe',
+  ];
+  const buildFiles = [
+    'build/conpty.vcxproj',
+    'build/conpty.vcxproj.filters',
+    'build/Release/conpty.exp',
+    'build/Release/conpty.iobj',
+    'build/Release/conpty.ipdb',
+    'build/Release/obj/conpty/conpty.tlog/CL.command.1.tlog',
+    'build/Release/obj/conpty/conpty.node.recipe',
+    'node-addon-api/node_addon_api_except.vcxproj',
+    'node-addon-api/Release/obj/node_addon_api_except/n.nativecodeanalysis.xml',
+  ];
+  for (const name of [...runtimeFiles, ...buildFiles]) {
+    const path = join(moduleRoot, name);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, name);
+  }
+  const config = resolveDesktopBuilderConfig({});
+  const packager = {
+    config,
+    appInfo: { type: 'module' },
+    debugLogger: { isEnabled: false },
+    getWorkspaceRoot: async () => root,
+  };
+  const destination = join(root, 'output');
+  const mainMatcher = getNodeModuleFileMatcher(root, destination, (s) => s, config.win, packager);
+  const matcher = new FileMatcher(moduleRoot, destination, (s) => s, mainMatcher.patterns);
+  const copier = new NodeModuleCopyHelper(matcher, packager);
+  const files = await copier.collectNodeModules(
+    { name: 'node-pty', dir: moduleRoot },
+    [],
+    join('node_modules', 'node-pty'),
+  );
+  assert.deepEqual(
+    files.map((file) => relative(moduleRoot, file).replaceAll('\\', '/')).sort(),
+    runtimeFiles.sort(),
+  );
+});
 
 test('packaged resources forbid the retired bundled Git distribution', async () => {
   const required = [];
