@@ -23,8 +23,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { after, describe, test } from 'node:test';
 import { createPackage } from '@electron/asar';
-import { FileMatcher, getNodeModuleFileMatcher } from 'app-builder-lib/out/fileMatcher.js';
+import {
+  FileMatcher,
+  getMainFileMatchers,
+  getNodeModuleFileMatcher,
+} from 'app-builder-lib/out/fileMatcher.js';
 import { NodeModuleCopyHelper } from 'app-builder-lib/out/util/NodeModuleCopyHelper.js';
+import { computeFileSets } from 'app-builder-lib/out/util/appFileCopier.js';
+import { doMergeConfigs } from 'app-builder-lib/out/util/config/config.js';
 import { resolveDesktopBuilderConfig } from '../apps/desktop/electron-builder.config.mjs';
 import {
   asarLookupPath,
@@ -32,7 +38,55 @@ import {
   assertPackagedResources,
 } from './verify-packaged-app.mjs';
 
-test('Windows packaging keeps node-pty runtime files without its build intermediates', async (t) => {
+test('Windows file rules keep test code and renderer side-files out of the app', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'maka-app-package-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtimeFiles = [
+    'package.json',
+    'dist/main/index.js',
+    'dist-renderer/index.html',
+    'dist/renderer/computer-use-overlay/index.js',
+  ];
+  for (const name of [
+    ...runtimeFiles,
+    'dist/main/__tests__/about.test.js',
+    'dist/main/test-only/bootstrap.js',
+    'dist/renderer/agent-graph-panel.js',
+  ]) {
+    const path = join(root, name);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, name);
+  }
+  // Config normalization runs before file matching in electron-builder.
+  const base = resolveDesktopBuilderConfig({});
+  const config = doMergeConfigs([{ ...base, files: [...base.files] }]);
+  const packager = {
+    config,
+    projectDir: root,
+    buildResourcesDir: 'build',
+    debugLogger: { isEnabled: false },
+  };
+  const platformPackager = { info: packager };
+  const output = join(root, 'release');
+  const matchers = getMainFileMatchers(
+    root,
+    output,
+    (s) => s,
+    config.win,
+    platformPackager,
+    output,
+    false,
+  );
+  const sets = await computeFileSets(matchers, null, platformPackager, false);
+  const files = [
+    ...new Set(
+      sets.flatMap((set) => set.files).map((file) => relative(root, file).replaceAll('\\', '/')),
+    ),
+  ];
+  assert.deepEqual(files.sort(), runtimeFiles.sort());
+});
+
+test('Desktop packaging keeps node-pty runtime files without its build intermediates', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'maka-pty-package-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const moduleRoot = join(root, 'node_modules', 'node-pty');
@@ -43,6 +97,8 @@ test('Windows packaging keeps node-pty runtime files without its build intermedi
     'lib/worker/conoutSocketWorker.js',
     'build/Release/conpty.node',
     'build/Release/conpty_console_list.node',
+    'build/Release/pty.node',
+    'build/Release/spawn-helper',
     'build/Release/conpty/conpty.dll',
     'build/Release/conpty/OpenConsole.exe',
     'prebuilds/win32-x64/conpty.node',
@@ -65,7 +121,8 @@ test('Windows packaging keeps node-pty runtime files without its build intermedi
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, name);
   }
-  const config = resolveDesktopBuilderConfig({});
+  const base = resolveDesktopBuilderConfig({});
+  const config = doMergeConfigs([{ ...base, files: [...base.files] }]);
   const packager = {
     config,
     appInfo: { type: 'module' },

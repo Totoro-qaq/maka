@@ -90,6 +90,11 @@ const baseDesktopBuilderConfig = {
     'dist/**/*',
     'dist-renderer/**/*',
     'package.json',
+    // Keep node-gyp's checkout-specific projects and link intermediates out.
+    // Native addons, the Unix spawn helper and ConPTY's DLL/helper are runtime files.
+    '!**/node_modules/node-pty/build/!(Release){,/**}',
+    '!**/node_modules/node-pty/build/Release/!(*.node|spawn-helper|conpty){,/**}',
+    '!**/node_modules/node-pty/node-addon-api{,/**}',
     '!node_modules/@maka/{mcp,runtime,runtime-host}/package.json',
     '!**/__tests__/**',
     // FakeBackend and the Desktop E2E candidate bootstrap live under
@@ -262,13 +267,6 @@ const baseDesktopBuilderConfig = {
   },
   win: {
     artifactName: 'Maka-${version}-win-${arch}.${ext}',
-    // node-gyp leaves checkout-specific projects and link intermediates here.
-    // Only the native addons and their ConPTY DLL/helper are used at runtime.
-    files: [
-      '!**/node_modules/node-pty/build/!(Release){,/**}',
-      '!**/node_modules/node-pty/build/Release/!(*.node|conpty){,/**}',
-      '!**/node_modules/node-pty/node-addon-api{,/**}',
-    ],
     // Same reason as `mac.icon` above: the .exe, the installer and the
     // shortcut are drawn by the OS from this file, not by us.
     icon: 'assets/app-icons/sky.png',
