@@ -1687,7 +1687,10 @@ describe('the shipped runtime default drives the proactive long-turn journey (is
   test('an anchor is discarded unless a run header proves it came from this model', async () => {
     // Input tokens are a count in one model's tokenizer; nothing converts them.
     // A header naming another model and no header at all fail the same way.
-    for (const priorInvocations of [[{ ...priorRunInvocation(), modelId: 'some-other-model' }], []]) {
+    for (const priorInvocations of [
+      [{ ...priorRunInvocation(), modelId: 'some-other-model' }],
+      [],
+    ]) {
       const fixture = buildFixture({
         priorChars: 2_000,
         contextWindow: 40_000,

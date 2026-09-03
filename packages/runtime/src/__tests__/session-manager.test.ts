@@ -598,7 +598,8 @@ describe('SessionManager graph operator provisioning', () => {
       } as never,
     });
     const parent = await manager.createSession(makeInput({ permissionMode: 'bypass' }));
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'supervisor-run',
@@ -687,7 +688,8 @@ describe('SessionManager graph operator provisioning', () => {
         permissionMode: 'ask',
       }),
     );
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'supervisor-run',
@@ -743,7 +745,8 @@ describe('SessionManager graph operator provisioning', () => {
       now: nextNow(90),
     });
     const parent = await manager.createSession(makeInput({ permissionMode: 'ask' }));
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'large-supervisor-run',
@@ -957,7 +960,8 @@ describe('SessionManager graph operator provisioning', () => {
         permissionMode: 'ask',
       }),
     );
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: parent.id,
         runId: 'supervisor-run',
@@ -1482,7 +1486,8 @@ describe('SessionManager claimed graph intent execution', () => {
       },
       'must not be backfilled',
     );
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: child.id,
         runId: claim.targetRunId,
@@ -1522,7 +1527,10 @@ describe('SessionManager claimed graph intent execution', () => {
     assert.strictEqual(hostedExecutions, 0);
     assert.strictEqual(backendBuilds, 0);
     assert.deepStrictEqual(await store.readMessages(child.id), []);
-    assert.strictEqual(runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)), 'completed');
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'completed',
+    );
   });
 
   test('hosted explicit abort stops only the exact claimed root identity', async () => {
@@ -1938,7 +1946,10 @@ describe('SessionManager claimed graph intent execution', () => {
     assert.strictEqual(result.status, 'cancelled');
     assert.strictEqual(backend?.stopCalls, 1);
     assert.strictEqual(backend?.sendInputs?.length, 1);
-    assert.strictEqual(runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)), 'cancelled');
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'cancelled',
+    );
   });
 
   test('runtime stop settles queued graph claims without letting their slots pass the active claim', async () => {
@@ -2100,7 +2111,10 @@ describe('SessionManager claimed graph intent execution', () => {
     const [result] = await Promise.all([executing, stopping]);
     assert.strictEqual(result.status, 'cancelled');
     assert.deepStrictEqual(backend?.sendInputs, []);
-    assert.strictEqual(runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)), 'cancelled');
+    assert.strictEqual(
+      runtimeInvocationOutcome(await readInvocation(runStore, child.id, claim.targetRunId)),
+      'cancelled',
+    );
     assert.strictEqual((await store.readHeader(child.id)).status === 'blocked', false);
   });
 
@@ -2157,7 +2171,8 @@ describe('SessionManager claimed graph intent execution', () => {
 
     const child = await createGraphOperatorSession(store, parent.id);
     const claim = graphIntentClaim({ targetSessionId: child.id }, 'must not run');
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: child.id,
         runId: 'different-run',
@@ -2585,7 +2600,10 @@ describe('SessionManager child-session runtime primitive', () => {
     const [firstResult, joinedResult] = await Promise.all([first, joined]);
     assert.strictEqual(joinedResult.childSessionId, firstResult.childSessionId);
     assert.strictEqual(joinedResult.runId, firstResult.runId);
-    assert.strictEqual((await runStore.listSessionInvocations(firstResult.childSessionId)).length, 1);
+    assert.strictEqual(
+      (await runStore.listSessionInvocations(firstResult.childSessionId)).length,
+      1,
+    );
 
     const durableRetry = await manager.spawnChildSession(parent.id, spawnInput);
     assert.strictEqual(durableRetry.childSessionId, firstResult.childSessionId);
@@ -4757,7 +4775,8 @@ describe('SessionManager permission mode updates', () => {
     });
     const session = await manager.createSession(makeInput());
     const header = await store.readHeader(session.id);
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         runId: 'source-run-safety-failure',
         sessionId: session.id,
@@ -6602,7 +6621,10 @@ describe('SessionManager permission mode updates', () => {
     );
 
     assert.strictEqual(backendCalls, 0);
-    await expectRejects(readInvocation(runStore, session.id, plan.continuation.runId), /unknown run/i);
+    await expectRejects(
+      readInvocation(runStore, session.id, plan.continuation.runId),
+      /unknown run/i,
+    );
   });
 
   test('revalidates terminal ledger consistency before executing a planned continuation', async () => {
@@ -6786,7 +6808,10 @@ describe('SessionManager permission mode updates', () => {
       collectSessionEvents(manager.resumeSafeBoundaryContinuation(plan.continuation)),
       /simulated claim-only crash/,
     );
-    await expectRejects(readInvocation(runStore, session.id, plan.continuation.runId), /unknown run/i);
+    await expectRejects(
+      readInvocation(runStore, session.id, plan.continuation.runId),
+      /unknown run/i,
+    );
     assert.strictEqual(backendCalls, 0);
 
     assert.ok(!(await manager.recoverInterruptedSessions()).includes(session.id));
@@ -6804,7 +6829,10 @@ describe('SessionManager permission mode updates', () => {
     assert.ok((await manager.recoverInterruptedSessions()).includes(session.id));
     const repairedRun = await readInvocation(runStore, session.id, plan.continuation.runId);
     assert.strictEqual(runtimeInvocationOutcome(repairedRun), 'failed');
-    assert.strictEqual(runtimeInvocationFailureClass(repairedRun),'continuation_abandoned_before_provider_dispatch');
+    assert.strictEqual(
+      runtimeInvocationFailureClass(repairedRun),
+      'continuation_abandoned_before_provider_dispatch',
+    );
     assert.partialDeepStrictEqual(repairedRun.opening.source, {
       kind: 'continuation',
       sourceRunId,
@@ -7139,7 +7167,10 @@ describe('SessionManager permission mode updates', () => {
     );
 
     assert.strictEqual(backendCalls, 0);
-    await expectRejects(readInvocation(runStore, session.id, plan.continuation.runId), /Unknown run/);
+    await expectRejects(
+      readInvocation(runStore, session.id, plan.continuation.runId),
+      /Unknown run/,
+    );
   });
 
   test('fails closed when continuation execution has no authoritative safety inspector', async () => {
@@ -7270,7 +7301,8 @@ describe('SessionManager permission mode updates', () => {
         partialOutputRetained: true,
       },
     ]);
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: session.id,
         runId: 'run-1',
@@ -8278,7 +8310,7 @@ describe('SessionManager permission mode updates', () => {
     const repairedRun = await readInvocation(runStore, session.id, 'run-1');
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
 
-    assert.strictEqual(runtimeInvocationFailureClass(repairedRun),'tool_failed');
+    assert.strictEqual(runtimeInvocationFailureClass(repairedRun), 'tool_failed');
     assert.deepStrictEqual(messages.at(-1), {
       type: 'turn_state',
       id: 'rt-failed',
@@ -8359,7 +8391,7 @@ describe('SessionManager permission mode updates', () => {
     const repairedRun = await readInvocation(runStore, session.id, 'run-1');
     const runtimeEvents = await runStore.readRuntimeEvents(session.id, 'run-1');
 
-    assert.strictEqual(runtimeInvocationFailureClass(repairedRun),'missing_terminal_event');
+    assert.strictEqual(runtimeInvocationFailureClass(repairedRun), 'missing_terminal_event');
     assert.strictEqual(runtimeEvents.filter((event) => event.status === 'failed').length, 1);
   });
 
@@ -8622,7 +8654,8 @@ describe('SessionManager permission mode updates', () => {
       },
     ];
     await store.appendMessages(session.id, activeMessages);
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: session.id,
         runId: 'run-2',
@@ -9638,7 +9671,7 @@ describe('SessionManager permission mode updates', () => {
     assert.strictEqual((await firstEvent).done, true);
     const [run] = await runStore.listSessionInvocations(session.id);
     assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
-    assert.strictEqual(run && runtimeInvocationFailureClass(run),undefined);
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), undefined);
   });
 
   test('late ignored-signal backend is disposed once and never cached or dispatched', async () => {
@@ -10496,7 +10529,8 @@ describe('SessionManager permission mode updates', () => {
       now: nextNow(6_849),
     });
     const session = await manager.createSession(makeInput());
-    await seedInvocationFromHeader(runStore, 
+    await seedInvocationFromHeader(
+      runStore,
       makeRunHeader({
         sessionId: session.id,
         runId: 'child-run',
@@ -10907,7 +10941,7 @@ describe('SessionManager permission mode updates', () => {
     assert.strictEqual(turn?.status, 'failed');
     assert.strictEqual(turn?.errorClass, 'runtime_error');
     const [run] = await runStore.listSessionInvocations(session.id);
-    assert.strictEqual(run && runtimeInvocationFailureClass(run),'runtime_error');
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), 'runtime_error');
   });
 
   test('marks an explicit step limit incomplete without blocking the session', async () => {
@@ -10936,7 +10970,7 @@ describe('SessionManager permission mode updates', () => {
     assert.strictEqual(turn?.errorClass, 'tool_step_cap_reached');
     const [run] = await runStore.listSessionInvocations(session.id);
     assert.strictEqual(run && runtimeInvocationOutcome(run), 'failed');
-    assert.strictEqual(run && runtimeInvocationFailureClass(run),'tool_step_cap_reached');
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), 'tool_step_cap_reached');
     const terminal = (await runStore.readRuntimeEvents(session.id, run!.runId)).find(
       (event) => event.actions?.endInvocation,
     );
@@ -11198,7 +11232,7 @@ describe('SessionManager permission mode updates', () => {
     assert.strictEqual(turn?.abortSource, 'renderer.stop_button');
     const [run] = await runStore.listSessionInvocations(session.id);
     assert.strictEqual(run && runtimeInvocationOutcome(run), 'cancelled');
-    assert.strictEqual(run && runtimeInvocationFailureClass(run),undefined);
+    assert.strictEqual(run && runtimeInvocationFailureClass(run), undefined);
     const events = (await runStore.readEvents(session.id, run!.runId)).map((event) => event.type);
     assert.ok(events.includes('run_cancelled'));
     assert.strictEqual(events.includes('run_failed'), false);
@@ -11853,7 +11887,10 @@ describe('SessionManager permission mode updates', () => {
     assert.strictEqual(turn?.errorClass, 'sandbox_boundary_closed_by_restart');
     const [run] = await runStore.listSessionInvocations(session.id);
     assert.strictEqual(run && runtimeInvocationOutcome(run), 'failed');
-    assert.strictEqual(run && runtimeInvocationFailureClass(run),'sandbox_boundary_closed_by_restart');
+    assert.strictEqual(
+      run && runtimeInvocationFailureClass(run),
+      'sandbox_boundary_closed_by_restart',
+    );
     assert.deepStrictEqual(await store.listPendingSandboxBoundaryRequests(session.id), []);
   });
 
