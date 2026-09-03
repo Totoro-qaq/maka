@@ -148,6 +148,7 @@ import {
   RuntimeInteractionFailStopError,
   RuntimeInteractionInvariantError,
   bindRuntimeInteractionRun,
+  isShutdownCancelledInteractionAdmission,
   type RuntimeInteractionAuthority,
   type RuntimeInteractionRunBinding,
   type RuntimeInteractionRunClosureReason,
@@ -1503,6 +1504,9 @@ export class RuntimeKernel implements RuntimeKernelLike {
     execution: PendingExecutionClaim,
     error: unknown,
   ): Promise<void> {
+    // A draining authority refused the start because everything is stopping, not
+    // because this run went wrong, so the run ends cancelled rather than failed.
+    if (isShutdownCancelledInteractionAdmission(error)) run.stop(undefined);
     try {
       await owners.failStart(error);
     } catch (failure) {
