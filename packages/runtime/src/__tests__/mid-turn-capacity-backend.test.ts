@@ -17,7 +17,8 @@
  * under the License.
  */
 
-import type { AgentRunHeader, ModelCallCommit } from '@maka/core/agent-run';
+import type { ModelCallCommit } from '@maka/core/agent-run';
+import type { RuntimeInvocationRecord } from '@maka/core/runtime-invocation';
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { setImmediate as flushMacrotask } from 'node:timers/promises';
@@ -72,7 +73,7 @@ interface MidTurnFixture {
   toolExecutions: string[];
   summarizerCalls: number;
   priorEvents: RuntimeEvent[];
-  priorRunHeaders: AgentRunHeader[];
+  priorInvocations: RuntimeInvocationRecord[];
   anchor: RuntimeEvent;
   /** The fixture's durable RuntimeEvent ledger for the current turn/run. */
   ledger: RuntimeEvent[];
@@ -158,7 +159,7 @@ interface MidTurnFixtureOptions {
   /** Prior-turn RuntimeEvents appended after the shaped priors (e.g. a persisted usage anchor). */
   extraPriorEvents?: readonly RuntimeEvent[];
   /** Run headers for the prior turns, so a persisted anchor can be identity-gated. */
-  priorRunHeaders?: readonly AgentRunHeader[];
+  priorInvocations?: readonly RuntimeInvocationRecord[];
   /** System prompt size sent through the provider's separate system field. */
   systemPromptChars?: number;
   /** Lower the pre-turn history-shaping threshold so that gate can be exercised. */
@@ -622,7 +623,7 @@ function buildFixture(options: MidTurnFixtureOptions = {}): MidTurnFixture {
       return fixture.ledgerReads;
     },
     priorEvents,
-    priorRunHeaders: [...(options.priorRunHeaders ?? [])],
+    priorInvocations: [...(options.priorInvocations ?? [])],
     anchor,
     ledger,
     modelCalls,
@@ -647,7 +648,7 @@ async function runFixtureTurn(
     text: ANCHOR_TEXT,
     context: [],
     runtimeContext: [...fixture.priorEvents],
-    runtimeContextRunHeaders: [...fixture.priorRunHeaders],
+    runtimeContextInvocations: [...fixture.priorInvocations],
   })) {
     if (consumer === 'slow') {
       // Scheduling perturbation: hold the durable write back across several
@@ -1620,7 +1621,7 @@ describe('the shipped runtime default drives the proactive long-turn journey (is
         finalAtSecondCall: true,
         ...(row.armGate ? { maxHistoryEstimatedTokens: 400 } : {}),
         extraPriorEvents: await priorAnchorEvents(row.priorAnchor),
-        ...(row.priorAnchor === 'none' ? {} : { priorRunHeaders: [priorRunHeader()] }),
+        ...(row.priorAnchor === 'none' ? {} : { priorInvocations: [priorRunInvocation()] }),
       });
       await runFixtureTurn(fixture);
 
@@ -1686,14 +1687,14 @@ describe('the shipped runtime default drives the proactive long-turn journey (is
   test('an anchor is discarded unless a run header proves it came from this model', async () => {
     // Input tokens are a count in one model's tokenizer; nothing converts them.
     // A header naming another model and no header at all fail the same way.
-    for (const priorRunHeaders of [[{ ...priorRunHeader(), modelId: 'some-other-model' }], []]) {
+    for (const priorInvocations of [[{ ...priorRunInvocation(), modelId: 'some-other-model' }], []]) {
       const fixture = buildFixture({
         priorChars: 2_000,
         contextWindow: 40_000,
         reserveTokens: 20_000,
         finalAtSecondCall: true,
         extraPriorEvents: [priorUsageEvent({ inputTokens: 30_000, payloadChars: 4_000 })],
-        priorRunHeaders,
+        priorInvocations,
       });
       await runFixtureTurn(fixture);
 
@@ -1801,22 +1802,48 @@ function priorUsageEvent(lastRequestAnchor: {
   };
 }
 
-function priorRunHeader(): AgentRunHeader {
-  return {
-    runId: 'run-0',
-    invocationId: 'run-0',
+/** The prior invocation on this route, as its own events describe it. */
+function priorRunInvocation(): RuntimeInvocationRecord {
+  const identity = {
     sessionId: 'session-1',
+    invocationId: 'run-0',
+    runId: 'run-0',
     turnId: 'turn-0',
-    status: 'completed',
-    backendKind: 'ai-sdk',
-    llmConnectionId: 'test-connection-id',
-    llmConnectionSlug: 'anthropic-main',
-    modelId: 'mock-model-id',
-    cwd: '/tmp/maka',
-    permissionMode: 'ask',
-    createdAt: 1,
-    updatedAt: 2,
-    completedAt: 2,
+  };
+  return {
+    ...identity,
+    openedAt: 1,
+    opening: {
+      kind: 'invocation_opened',
+      protocol: 'invocation_opened_v1',
+      route: {
+        provenance: 'runtime',
+        backendKind: 'ai-sdk',
+        llmConnectionId: 'test-connection-id',
+        llmConnectionSlug: 'anthropic-main',
+        modelId: 'mock-model-id',
+      },
+      configuration: {
+        cwd: '/tmp/maka',
+        permissionMode: 'ask',
+        collaborationMode: 'agent',
+        orchestrationMode: 'default',
+        orchestrationSource: 'session',
+        toolMode: 'direct',
+      },
+      root: { kind: 'user' },
+      source: { kind: 'fresh' },
+    },
+    terminalEvent: {
+      ...identity,
+      id: `${identity.runId}-terminal`,
+      ts: 2,
+      partial: false,
+      role: 'system',
+      author: 'system',
+      status: 'completed',
+      actions: { endInvocation: true },
+    },
   };
 }
 

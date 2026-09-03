@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
-import type { AgentRunHeader } from '@maka/core/agent-run';
+import type { RuntimeInvocationRecord } from '@maka/core/runtime-invocation';
 import type { SessionEvent } from '@maka/core/events';
 import type { BackendSessionEvent } from '@maka/core/backend-types';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
@@ -590,19 +590,33 @@ const PROJECTION_SAMPLES: ProjectionSamples = {
   abort: { subject: { type: 'abort', id: 'e', turnId: 'turn-1', ts: 1, reason: 'user_stop' } },
 };
 
-const projectionRunHeader: AgentRunHeader = {
-  runId: 'run-1',
+const projectionInvocation: RuntimeInvocationRecord = {
   sessionId: 'session-1',
+  invocationId: 'invocation-1',
+  runId: 'run-1',
   turnId: 'turn-1',
-  status: 'completed',
-  backendKind: 'ai-sdk',
-  llmConnectionSlug: 'anthropic',
-  modelId: 'model-1',
-  cwd: '/tmp',
-  permissionMode: 'ask',
-  createdAt: 1,
-  updatedAt: 2,
-  completedAt: 2,
+  openedAt: 1,
+  opening: {
+    kind: 'invocation_opened',
+    protocol: 'invocation_opened_v1',
+    route: {
+      provenance: 'runtime',
+      backendKind: 'ai-sdk',
+      llmConnectionId: 'anthropic-connection',
+      llmConnectionSlug: 'anthropic',
+      modelId: 'model-1',
+    },
+    configuration: {
+      cwd: '/tmp',
+      permissionMode: 'ask',
+      collaborationMode: 'agent',
+      orchestrationMode: 'default',
+      orchestrationSource: 'session',
+      toolMode: 'direct',
+    },
+    root: { kind: 'user' },
+    source: { kind: 'fresh' },
+  },
 };
 
 describe('SessionEvent projection coverage', () => {
@@ -667,7 +681,7 @@ describe('SessionEvent projection coverage', () => {
         .filter((event) => !isNonTerminalErrorRuntimeEvent(event));
 
       const projected = projectRuntimeEventsToStoredMessages(runtimeEvents, {
-        runHeaders: [projectionRunHeader],
+        invocations: [projectionInvocation],
       });
 
       assert.deepEqual(projected.diagnostics.filter(isUnclaimedRuntimeEventDiagnostic), []);
@@ -691,7 +705,7 @@ describe('SessionEvent projection coverage', () => {
     assert.equal(runtimeEvent.actions?.stateDelta?.unmappedSessionEventType, 'not_yet_mapped');
 
     const projected = projectRuntimeEventsToStoredMessages([runtimeEvent], {
-      runHeaders: [projectionRunHeader],
+      invocations: [projectionInvocation],
     });
     assert.deepEqual(projected.messages, []);
     // Filtered through the predicate the contract above uses, not just compared
