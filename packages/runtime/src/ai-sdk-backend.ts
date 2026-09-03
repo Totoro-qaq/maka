@@ -1904,7 +1904,7 @@ export class AiSdkBackend implements AgentBackend {
             projectionCheckpoint,
             compatibleProviderReasoningReplayEventIds(
               replayEvents,
-              input.runtimeContextRunHeaders,
+              input.runtimeContextInvocations,
               this.input.providerStateIdentity,
               this.input.modelId,
               scope.runId,
@@ -3378,7 +3378,7 @@ export class AiSdkBackend implements AgentBackend {
     const priorRuntimeContext = preparedContextBudget.events;
     const providerReasoningReplayEventIds = compatibleProviderReasoningReplayEventIds(
       priorRuntimeContext,
-      input.runtimeContextRunHeaders,
+      input.runtimeContextInvocations,
       this.input.providerStateIdentity,
       this.input.modelId,
     );
@@ -3428,7 +3428,7 @@ export class AiSdkBackend implements AgentBackend {
           turnId: input.turnId,
           runId: scope.runId,
           runtimeContext: priorRuntimeContext,
-          runtimeContextRunHeaders: input.runtimeContextRunHeaders,
+          runtimeContextInvocations: input.runtimeContextInvocations,
         },
         automaticMemorySource
           ? {
