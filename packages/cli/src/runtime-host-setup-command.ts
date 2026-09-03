@@ -120,7 +120,7 @@ import type {
 } from './runtime-host-lifecycle-provider.js';
 import {
   resolveRuntimeHostManagedPeerKeyPath,
-  resolveRuntimeHostPeerNativePath,
+  resolveRuntimeHostNativePath,
 } from './runtime-host-peer-artifact.js';
 import { activateRuntimeHostManagedDeploymentWithReconciliation } from './runtime-host-activation-command.js';
 
@@ -179,7 +179,7 @@ interface RuntimeHostSetupDeps {
   readonly resolveRegistryCandidate: typeof resolveRuntimeHostRegistryUpdateCandidate;
   readonly withRegistryPackage: typeof withRuntimeHostRegistryUpdatePackage;
   readonly ensurePeerIdentity: typeof ensureRuntimeHostPeerIdentity;
-  readonly resolvePeerNativePath: typeof resolveRuntimeHostPeerNativePath;
+  readonly resolvePeerNativePath: typeof resolveRuntimeHostNativePath;
   readonly allocateLoopbackPort: typeof allocateRuntimeHostLoopbackPort;
   readonly allocatePeerPort: typeof allocateRuntimeHostPeerPort;
   readonly writeOutput: (value: string) => unknown;
@@ -263,7 +263,7 @@ export async function runRuntimeHostSetupCli(
     resolveRegistryCandidate: resolveRuntimeHostRegistryUpdateCandidate,
     withRegistryPackage: withRuntimeHostRegistryUpdatePackage,
     ensurePeerIdentity: ensureRuntimeHostPeerIdentity,
-    resolvePeerNativePath: resolveRuntimeHostPeerNativePath,
+    resolvePeerNativePath: resolveRuntimeHostNativePath,
     allocateLoopbackPort: allocateRuntimeHostLoopbackPort,
     allocatePeerPort: allocateRuntimeHostPeerPort,
     writeOutput: (value) => process.stdout.write(value),

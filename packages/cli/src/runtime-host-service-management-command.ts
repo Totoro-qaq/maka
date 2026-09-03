@@ -60,6 +60,7 @@ import {
   createSystemdUserRuntimeHostService,
 } from './runtime-host-systemd-service.js';
 import { createOpenRcRuntimeHostLifecycleProvider } from './runtime-host-openrc-service.js';
+import { createWindowsRuntimeHostLifecycleProvider } from './runtime-host-windows-service.js';
 import type {
   RuntimeHostLifecycleProvider,
   RuntimeHostLifecycleProviderOffer,
@@ -498,10 +499,15 @@ export async function discoverRuntimeHostLifecycleProvider(
     await provider.supervisor.preflight();
     return { provider, availability: 'session' };
   }
+  if (platform === 'win32') {
+    const provider = createWindowsRuntimeHostLifecycleProvider(rootId);
+    await provider.supervisor.preflight();
+    return { provider, availability: 'session' };
+  }
   if (platform !== 'linux') {
     throw new RuntimeHostServiceManagerError(
       'unsupported_platform',
-      'Supervised Runtime Host deployments currently require Linux or macOS',
+      'Supervised Runtime Host deployments currently require Linux, macOS, or Windows',
     );
   }
 
@@ -555,6 +561,7 @@ export function resolveRuntimeHostLifecycleProvider(
 ): RuntimeHostLifecycleProvider {
   if (provider === 'systemd_user') return createSystemdUserRuntimeHostLifecycleProvider(rootId, {});
   if (provider === 'launch_agent') return createLaunchAgentRuntimeHostLifecycleProvider(rootId);
+  if (provider === 'windows_task') return createWindowsRuntimeHostLifecycleProvider(rootId);
   return createOpenRcRuntimeHostLifecycleProvider(rootId, provider);
 }
 

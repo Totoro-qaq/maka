@@ -784,7 +784,6 @@ async function runCanonicalRuntimeHostUpdate(
           return 1;
         }
         staged = undefined;
-        await deps.prunePackages(desired);
         const updated = await deps.canonical.manageLifecycle(
           options.managedRootId,
           {
@@ -797,6 +796,7 @@ async function runCanonicalRuntimeHostUpdate(
           },
           { resolveProvider: resolveRuntimeHostLifecycleProvider },
         );
+        await deps.prunePackages(desired);
         emit({
           schemaVersion: 1,
           kind: 'result',

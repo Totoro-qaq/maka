@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { deriveMakaDataRoots, resolveMakaDataRoots } from './workspace-root.js';
 import {
   configureRuntimeHostPeerClient,
-  resolveRuntimeHostPeerNativePath,
+  resolveRuntimeHostNativePath,
 } from './runtime-host-peer-artifact.js';
 import {
   parseRuntimeHostCommand,
@@ -335,7 +335,7 @@ export async function runMakaCli(
           ...(peer
             ? {
                 peer: {
-                  nativePath: await resolveRuntimeHostPeerNativePath(packageLayout.cliPath),
+                  nativePath: await resolveRuntimeHostNativePath(packageLayout.cliPath),
                   keyPath: peer.keyPath,
                   expectedPeerId: peer.peerId,
                   listenAddresses: peer.listenAddresses,
