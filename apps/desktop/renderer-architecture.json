@@ -350,8 +350,8 @@
           "@maka/runtime/skill-invocation": 1,
           "@maka/ui": 1
         },
-        "importSpecifiers": 39,
-        "nonTriviaTokens": 4089
+        "importSpecifiers": 38,
+        "nonTriviaTokens": 4275
       },
       "src/renderer/app-shell-chrome-actions.tsx": {
         "importDeclarations": 5,
@@ -980,7 +980,7 @@
           "react": 1
         },
         "importSpecifiers": 184,
-        "nonTriviaTokens": 15692
+        "nonTriviaTokens": 15691
       },
       "src/renderer/use-app-shell-composer-quotes.ts": {
         "importDeclarations": 3,

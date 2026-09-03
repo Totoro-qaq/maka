@@ -799,9 +799,8 @@ function AppShellContent({
     const owner = sessions.find((session) => session.id === draft.draftSessionId);
     if (source && owner && !source.isArchived && !owner.isArchived) return;
     composerRef.current?.clearDraft(draft.draftSessionId);
-    if (draft.sourceSessionId !== draft.draftSessionId) {
+    if (draft.sourceSessionId !== draft.draftSessionId)
       composerRef.current?.clearDraft(draft.sourceSessionId);
-    }
     if (draft.copyPhase === 'reserved') completeTurnRevisionCopyAttempt(draft);
     else void abandonTurnRevisionCopyAttempt(draft);
     commitRevisionDraft(null);
@@ -1022,12 +1021,7 @@ function AppShellContent({
       // Abandoning the proposal is what leaves Plan: Runtime writes the
       // Session back to `agent` itself as part of it.
       await window.maka.sessions.abandonPlanProposal(sessionId, latestProposal.proposalId);
-    } else {
-      await window.maka.sessions.setCollaborationMode(
-        sessionId,
-        active ? 'plan' : 'agent',
-      );
-    }
+    } else await window.maka.sessions.setCollaborationMode(sessionId, active ? 'plan' : 'agent');
     return true;
   }
 
@@ -1145,11 +1139,8 @@ function AppShellContent({
         composerRef.current?.appendText(shellCopy.useSkillPrompt(skillName));
       composerRef.current?.focus();
     };
-    if (activeIdRef.current) {
-      window.requestAnimationFrame(seed);
-      return;
-    }
-    void createSession().then(() => window.requestAnimationFrame(seed));
+    if (activeIdRef.current) window.requestAnimationFrame(seed);
+    else void createSession().then(() => window.requestAnimationFrame(seed));
     },
     [shellCopy],
   );
@@ -1899,9 +1890,8 @@ function AppShellContent({
 
   function settleNewTaskImageNoticeOwner(sourceSessionId?: string) {
     const createdSessionId = activeIdRef.current;
-    if (!sourceSessionId && createdSessionId) {
+    if (!sourceSessionId && createdSessionId)
       imageNoticeLifecycle.transfer(NEW_TASK_PENDING_KEY, createdSessionId);
-    }
   }
 
   async function enqueueFollowUp(
@@ -2269,9 +2259,8 @@ function AppShellContent({
     showModelSetupToast,
     toastApi,
     notifyRunEnded: ({ kind, sessionId, body }) => {
-      if (kind === 'completed' && activeIdRef.current === sessionId) {
+      if (kind === 'completed' && activeIdRef.current === sessionId)
         setPetCompletionNonce((current) => current + 1);
-      }
       const title = sessionsRef.current.find((session) => session.id === sessionId)?.name;
       // Best-effort: swallow any main-side failure so a missed banner
       // never surfaces as an unhandled promise rejection.
@@ -2575,9 +2564,8 @@ function AppShellContent({
     activeId,
   );
   function handleTranscriptReadingAnchorChange(turnId?: string) {
-    if (activeId && activeUnavailableTranscriptRestore) {
+    if (activeId && activeUnavailableTranscriptRestore)
       sessionUiController.setTranscriptRestoreUnavailable(activeId, undefined);
-    }
     transcriptReadingPosition.captureAnchor({
       sessionId: activeId,
       currentSessionId: activeIdRef.current,
@@ -2595,9 +2583,7 @@ function AppShellContent({
     try {
       if (target === 'earlier') {
         await controller.loadBefore(DESKTOP_TRANSCRIPT_RANGE_MAX_BYTES, anchorTurnId);
-      } else {
-        await controller.loadLatest();
-      }
+      } else await controller.loadLatest();
     } catch (error) {
       if (
         activeIdRef.current !== sessionId ||
