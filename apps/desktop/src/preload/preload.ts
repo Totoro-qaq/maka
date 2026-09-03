@@ -220,6 +220,7 @@ import type {
 import type { AttachmentRef, InlineReference, QuoteRef } from '@maka/core/events';
 import type { OnboardingMilestoneId } from '@maka/core/onboarding';
 import {
+  decodeSharedSessionCatalogProjection,
   SCHEDULED_TASK_CATALOG_MAX_ITEMS,
   type OperationInput,
   type OperationOutcome,
@@ -906,7 +907,7 @@ async function listDesktopSessions(
     () => [...runtimeHostMetadata.values()].map(({ profileId }) => profileId),
     // Unknown Guest coverage cannot suppress healthy Owner catalogs or prove
     // that a previously observed Guest mount was removed.
-    listKnownGuestMountProfileIds(),
+    listRetainedGuestCatalog(),
   );
   return lastDesktopSessionCatalog;
 }
@@ -933,22 +934,81 @@ async function listDesktopSessionsWithCoverage(): Promise<{
   return catalog;
 }
 
-async function listKnownGuestMountProfileIds(): Promise<string[]> {
+async function listRetainedGuestCatalog(): Promise<{
+  profileIds: string[];
+  sessions: DesktopSessionSummary[];
+}> {
   const mounts: unknown = await ipcRenderer.invoke('session-collaboration:mount:list');
   if (!Array.isArray(mounts)) {
     throw new Error('Desktop shared Session mounts are unavailable');
   }
-  return mounts.map((mount) => {
+  const profileIds: string[] = [];
+  const sessions: DesktopSessionSummary[] = [];
+  for (const mount of mounts) {
     if (
       !mount ||
       typeof mount !== 'object' ||
       !('mountId' in mount) ||
-      typeof mount.mountId !== 'string'
+      typeof mount.mountId !== 'string' ||
+      !('name' in mount) ||
+      typeof mount.name !== 'string' ||
+      !('hostId' in mount) ||
+      typeof mount.hostId !== 'string'
     ) {
       throw new Error('Desktop shared Session mount is invalid');
     }
-    return mount.mountId;
-  });
+    profileIds.push(mount.mountId);
+    if (!('session' in mount) || mount.session === undefined) continue;
+    const session = decodeSharedSessionCatalogProjection(mount.session);
+    const summary: SessionCatalogSummary & {
+      readonly labelsTruncated: boolean;
+      readonly shared: true;
+    } = {
+      id: session.id,
+      name: session.name,
+      activityAt: session.activityAt,
+      isFlagged: false,
+      isArchived: false,
+      labels: [],
+      labelsTruncated: false,
+      hasUnread: false,
+      ...(session.lastMessageAt === undefined
+        ? {}
+        : { lastMessageAt: session.lastMessageAt }),
+      ...(session.lastMessagePreview === undefined
+        ? {}
+        : { lastMessagePreview: session.lastMessagePreview }),
+      status: session.status,
+      ...(session.blockedReason === undefined
+        ? {}
+        : { blockedReason: session.blockedReason }),
+      ...(session.statusUpdatedAt === undefined
+        ? {}
+        : { statusUpdatedAt: session.statusUpdatedAt }),
+      backend: 'ai-sdk',
+      llmConnectionSlug: '',
+      connectionLocked: true,
+      model: '',
+      permissionMode: 'ask',
+      shared: true,
+    };
+    const projected = projectDesktopSessionSummary(
+      {
+        hostId: mount.hostId,
+        profileId: mount.mountId,
+        profileName: mount.name,
+        profileKind: 'remote',
+      },
+      summary,
+    );
+    sessions.push(projected);
+    const scopeKey = runtimeHostProfiles.get(mount.mountId);
+    const scope = scopeKey ? runtimeHostScopes.get(scopeKey) : undefined;
+    if (scopeKey && scope?.hostId === mount.hostId) {
+      runtimeHostSessionScopes.set(projected.id, scopeKey);
+    }
+  }
+  return { profileIds, sessions };
 }
 
 async function createDesktopSessionOnScope(

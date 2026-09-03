@@ -33,23 +33,32 @@ export interface RuntimeHostSessionCatalogCoverage {
 export interface RuntimeHostSessionCatalogSnapshot extends RuntimeHostSessionCatalogCoverage {
   /** Profiles still retained by Desktop, including unavailable Guest mounts. */
   readonly knownProfileIds: string[];
+  /** Last authenticated Guest rows retained across a Desktop restart. */
+  readonly retainedGuestSessions?: DesktopSessionSummary[];
+}
+
+export interface RuntimeHostRetainedGuestCatalog {
+  readonly profileIds: string[];
+  readonly sessions: DesktopSessionSummary[];
 }
 
 export async function resolveRuntimeHostSessionCatalog(
   current: readonly DesktopSessionSummary[],
   coverage: Promise<RuntimeHostSessionCatalogCoverage>,
   knownRuntimeProfileIds: () => readonly string[],
-  guestMountProfileIds: Promise<readonly string[]>,
+  retainedGuestCatalog: Promise<RuntimeHostRetainedGuestCatalog>,
 ): Promise<DesktopSessionSummary[]> {
-  const [snapshot, knownGuestProfileIds] = await Promise.all([
+  const [snapshot, retainedGuests] = await Promise.all([
     coverage,
-    guestMountProfileIds.catch(() =>
-      current.flatMap((session) => session.shared === true ? [session.profileId] : []),
-    ),
+    retainedGuestCatalog.catch(() => ({
+      profileIds: current.flatMap((session) => session.shared === true ? [session.profileId] : []),
+      sessions: [],
+    })),
   ]);
   return reconcileRuntimeHostSessionCatalog(current, {
     ...snapshot,
-    knownProfileIds: [...knownRuntimeProfileIds(), ...knownGuestProfileIds],
+    knownProfileIds: [...knownRuntimeProfileIds(), ...retainedGuests.profileIds],
+    retainedGuestSessions: retainedGuests.sessions,
   });
 }
 
@@ -96,7 +105,7 @@ export function reconcileRuntimeHostSessionCatalog(
   const knownProfileIds = new Set(snapshot.knownProfileIds);
   return sortSessionCatalogs([
     ...snapshot.sessions,
-    ...current.filter(
+    ...[...current, ...(snapshot.retainedGuestSessions ?? [])].filter(
       (session) =>
         knownProfileIds.has(session.profileId) && !completeHostIds.has(session.runtimeHostId),
     ),

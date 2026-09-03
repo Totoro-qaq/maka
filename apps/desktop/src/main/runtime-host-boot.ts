@@ -621,6 +621,34 @@ const guestSessionMountService = createDesktopGuestSessionMountService({
     if (!runtimeHostManager) throw new Error('Runtime Host manager is unavailable');
     return runtimeHostManager.finalizeGuestAccess(mountId, signal, onAccessActivated);
   },
+  getSharedSession: async (mountId) => {
+    const current = runtimeHostManager?.current(mountId);
+    if (!current?.candidate) {
+      throw new Error('Shared Session Runtime Host is reconnecting');
+    }
+    return current.candidate.client.getSharedSession();
+  },
+  inspect: (mountId) => {
+    const state = runtimeHostManager?.entries().find(
+      (candidate) => candidate.target.profile.id === mountId,
+    );
+    if (!state) return undefined;
+    return {
+      readiness: state.readiness,
+      ...(state.readiness === 'ready' && state.candidate.client.peerPath
+        ? { peerPath: state.candidate.client.peerPath }
+        : {}),
+    };
+  },
+  onSessionAvailable: (mountId, sessionId) => {
+    const current = runtimeHostManager?.current(mountId);
+    if (!current?.candidate) return;
+    emitSessionsChanged(
+      { hostId: current.candidate.client.hostId, targetEpoch: current.epoch },
+      'updated',
+      sessionId,
+    );
+  },
   unmount: async (mountId) => {
     if (!runtimeHostManager) return;
     await runtimeHostManager.unmountGuest(mountId);

@@ -104,6 +104,25 @@ test('retains a Guest catalog row only while its Runtime Host profile remains kn
   );
 });
 
+test('restores an authenticated Guest row from durable mount metadata after restart', async () => {
+  const retained = {
+    ...session('shared-session', 2),
+    runtimeHostId: 'guest-host',
+    profileId: 'guest-profile',
+    shared: true as const,
+  };
+
+  assert.deepEqual(
+    await resolveRuntimeHostSessionCatalog(
+      [],
+      Promise.resolve({ sessions: [], completeHostIds: [] }),
+      () => [],
+      Promise.resolve({ profileIds: ['guest-profile'], sessions: [retained] }),
+    ),
+    [retained],
+  );
+});
+
 test('keeps healthy Owner catalogs when Guest mount inventory is unavailable', async () => {
   const owner = {
     ...session('owner-session', 3),

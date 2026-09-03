@@ -26,10 +26,12 @@ import {
 import {
   encodeCollaborationInvitationCode,
   type HostPeerEndpoint,
+  type SharedSessionCatalogProjection,
 } from '@maka/runtime-host/protocol';
 import { encodeDesktopCollaborationInvitation } from '../runtime-host-collaboration-invitation.js';
 import {
   createDesktopGuestSessionMountService,
+  createGuestSessionMountStore,
   type GuestSessionMount,
   type GuestSessionMountStore,
   registerDesktopGuestSessionMountIpc,
@@ -39,7 +41,7 @@ import { RuntimeHostPairingFinalizationInterruptedError } from '../runtime-host-
 const ROOT_ID = 'a'.repeat(64);
 
 test('retains a successful Guest mount and rehydrates the same authority after restart', async () => {
-  const store = memoryStore();
+  const store = serializedStore();
   const activated: string[] = [];
   const first = service(store, {
     mount: async (target) => {
@@ -61,7 +63,30 @@ test('retains a successful Guest mount and rehydrates the same authority after r
   });
   assert.equal(await rehydrated, `${result.mountId}:guest-one`);
   assert.deepEqual(activated, [`${result.mountId}:guest-one`]);
+  assert.deepEqual((await second!.list())[0]?.session, sharedSession());
   await second!.close();
+});
+
+test('collapses fresh credentials for the same authenticated shared Session', async () => {
+  const store = memoryStore();
+  const unmounted: string[] = [];
+  const mounts = service(store, {
+    unmount: async (mountId) => {
+      unmounted.push(mountId);
+    },
+  });
+
+  const first = await mounts.importInvitation(invitation('guest-first'), false, 'first');
+  const second = await mounts.importInvitation(invitation('guest-second'), false, 'second');
+  assert.equal(first.kind, 'connected');
+  assert.equal(second.kind, 'connected');
+  if (first.kind !== 'connected' || second.kind !== 'connected') return;
+
+  const retained = await mounts.list();
+  assert.deepEqual(retained.map(({ mountId }) => mountId), [second.mountId]);
+  assert.deepEqual((await store.read()).map(({ mountId }) => mountId), [second.mountId]);
+  assert.deepEqual(unmounted, [first.mountId]);
+  await mounts.close();
 });
 
 test('reports activated Guest access as recovering while reauthentication continues', async () => {
@@ -365,6 +390,62 @@ test('retains and reconciles a mount when finalization outcome is unknown', asyn
   await mounts.close();
 });
 
+test('finishes a committed credential reconnect and records its Session projection', async () => {
+  const store = memoryStore();
+  let attempts = 0;
+  let markAvailable!: () => void;
+  const available = new Promise<void>((resolve) => {
+    markAvailable = resolve;
+  });
+  const mounts = service(store, {
+    finalizeAccess: async () => {
+      attempts += 1;
+      return attempts === 1 ? 'reconnecting' : 'ready';
+    },
+    getSharedSession: async () => {
+      markAvailable();
+      return sharedSession();
+    },
+    wait: async () => undefined,
+  });
+
+  const result = await mounts.importInvitation(invitation('guest-rotated'), false, 'rotated');
+  assert.equal(result.kind, 'recovering');
+  await available;
+
+  assert.equal(attempts, 2);
+  assert.equal((await mounts.list())[0]?.readiness, 'ready');
+  assert.deepEqual((await store.read())[0]?.session, sharedSession());
+  await mounts.close();
+});
+
+test('retains a finalized mount when its first Session projection read is interrupted', async () => {
+  const store = memoryStore();
+  let reads = 0;
+  let markAvailable!: () => void;
+  const available = new Promise<void>((resolve) => {
+    markAvailable = resolve;
+  });
+  const mounts = service(store, {
+    getSharedSession: async () => {
+      reads += 1;
+      if (reads === 1) throw new Error('connection changed after credential finalization');
+      return sharedSession();
+    },
+    onSessionAvailable: () => markAvailable(),
+    wait: async () => undefined,
+  });
+
+  const result = await mounts.importInvitation(invitation('guest-finalized'), false, 'finalized');
+  assert.equal(result.kind, 'recovering');
+  assert.equal((await store.read()).length, 1);
+  await available;
+
+  assert.equal(reads, 2);
+  assert.deepEqual((await store.read())[0]?.session, sharedSession());
+  await mounts.close();
+});
+
 test('cancels an in-flight import and removes its durable mount desire', async () => {
   const store = memoryStore();
   let connecting!: () => void;
@@ -444,6 +525,9 @@ function service(
   overrides: {
     readonly mount?: Parameters<typeof createDesktopGuestSessionMountService>[0]['mount'];
     readonly finalizeAccess?: Parameters<typeof createDesktopGuestSessionMountService>[0]['finalizeAccess'];
+    readonly getSharedSession?: Parameters<typeof createDesktopGuestSessionMountService>[0]['getSharedSession'];
+    readonly inspect?: Parameters<typeof createDesktopGuestSessionMountService>[0]['inspect'];
+    readonly onSessionAvailable?: Parameters<typeof createDesktopGuestSessionMountService>[0]['onSessionAvailable'];
     readonly unmount?: Parameters<typeof createDesktopGuestSessionMountService>[0]['unmount'];
     readonly wait?: Parameters<typeof createDesktopGuestSessionMountService>[0]['wait'];
     readonly onError?: Parameters<typeof createDesktopGuestSessionMountService>[0]['onError'];
@@ -453,10 +537,25 @@ function service(
     store,
     mount: overrides.mount ?? (async () => undefined),
     finalizeAccess: overrides.finalizeAccess ?? (async () => 'ready'),
+    getSharedSession: overrides.getSharedSession ?? (async () => sharedSession()),
+    ...(overrides.inspect ? { inspect: overrides.inspect } : {}),
+    ...(overrides.onSessionAvailable ? { onSessionAvailable: overrides.onSessionAvailable } : {}),
     unmount: overrides.unmount ?? (async () => undefined),
     ...(overrides.wait ? { wait: overrides.wait } : {}),
     onError: overrides.onError ?? (() => undefined),
   });
+}
+
+function sharedSession(id = 'session-shared'): SharedSessionCatalogProjection {
+  return {
+    kind: 'shared_session',
+    id,
+    revision: 1,
+    createdAt: 1,
+    activityAt: 2,
+    name: 'Shared task',
+    status: 'active',
+  };
 }
 
 function memoryStore(): GuestSessionMountStore {
@@ -467,6 +566,16 @@ function memoryStore(): GuestSessionMountStore {
       mounts = next.map((mount) => ({ ...mount }));
     },
   };
+}
+
+function serializedStore(): GuestSessionMountStore {
+  let secret: string | null = null;
+  return createGuestSessionMountStore({
+    getSecret: async () => secret,
+    setSecret: async (_slug, _kind, value) => {
+      secret = value;
+    },
+  });
 }
 
 function invitation(credential: string): string {

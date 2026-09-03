@@ -24,11 +24,14 @@ import {
   RuntimeHostPermanentReconnectError,
   type ResolvedRuntimeHostProfile,
   type RuntimeHostConnectionPhase,
+  type RuntimeHostPeerConnectionPath,
   type RuntimeHostRemoteTransport,
 } from '@maka/runtime-host/client';
 import {
   decodeCollaborationInvitationCode,
+  decodeSharedSessionCatalogProjection,
   type HostPeerEndpoint,
+  type SharedSessionCatalogProjection,
 } from '@maka/runtime-host/protocol';
 import type { CredentialStore } from '@maka/storage/credential-store';
 import type {
@@ -57,7 +60,10 @@ export interface GuestSessionMount {
   readonly rootId: string;
   readonly transport: RuntimeHostRemoteTransport;
   readonly credential: string;
+  readonly session?: SharedSessionCatalogProjection;
 }
+
+type GuestSessionMountReadiness = SessionCollaborationMountSummary['readiness'];
 
 interface GuestSessionMountDocument {
   readonly schemaVersion: typeof STORE_SCHEMA_VERSION;
@@ -67,6 +73,7 @@ interface GuestSessionMountDocument {
 interface LiveGuestActivationBase {
   readonly controller: AbortController;
   stage: 'connecting' | 'finalizing';
+  accessActivated: boolean;
   finalization?: Promise<RuntimeHostGuestAccessFinalization>;
   task: Promise<unknown>;
 }
@@ -144,6 +151,14 @@ export function createDesktopGuestSessionMountService(input: {
     signal: AbortSignal,
     onAccessActivated?: () => void,
   ) => Promise<RuntimeHostGuestAccessFinalization>;
+  readonly getSharedSession: (
+    mountId: string,
+  ) => Promise<SharedSessionCatalogProjection | null>;
+  readonly inspect?: (mountId: string) => {
+    readonly readiness: GuestSessionMountReadiness;
+    readonly peerPath?: RuntimeHostPeerConnectionPath;
+  } | undefined;
+  readonly onSessionAvailable?: (mountId: string, sessionId: string) => void;
   readonly unmount: (mountId: string) => Promise<void>;
   readonly wait?: (delayMs: number, signal: AbortSignal) => Promise<void>;
   readonly onError?: (error: Error, mount: GuestSessionMount) => void;
@@ -154,6 +169,7 @@ export function createDesktopGuestSessionMountService(input: {
   });
   const activations = new Set<LiveGuestActivation>();
   const removingMounts = new Set<string>();
+  const readiness = new Map<string, GuestSessionMountReadiness>();
   let mounts: Map<string, GuestSessionMount> | undefined;
   let mutationTail = Promise.resolve();
   let closed = false;
@@ -203,11 +219,47 @@ export function createDesktopGuestSessionMountService(input: {
     }).catch((error: unknown) => onError(asError(error), mount));
   };
 
+  const recordSharedSession = async (
+    mount: GuestSessionMount,
+    session: SharedSessionCatalogProjection,
+  ): Promise<void> => {
+    const superseded = await mutate(async () => {
+      const current = await load();
+      const retained = current.get(mount.mountId);
+      if (!retained) throw new Error('Shared Session mount was removed while connecting');
+      const next = new Map(current);
+      const duplicates: GuestSessionMount[] = [];
+      for (const candidate of current.values()) {
+        if (
+          candidate.mountId === mount.mountId ||
+          candidate.rootId !== mount.rootId ||
+          candidate.session?.id !== session.id
+        ) continue;
+        duplicates.push(candidate);
+        next.delete(candidate.mountId);
+      }
+      next.set(mount.mountId, decodeMount({ ...retained, session: retainedSession(session) }));
+      await persist(next);
+      return duplicates;
+    });
+    readiness.set(mount.mountId, 'ready');
+    try {
+      input.onSessionAvailable?.(mount.mountId, session.id);
+    } catch (error) {
+      onError(asError(error), mount);
+    }
+    for (const duplicate of superseded) {
+      readiness.delete(duplicate.mountId);
+      void input.unmount(duplicate.mountId).catch((error) => onError(asError(error), duplicate));
+    }
+  };
+
   const activate = async (
     activation: LiveGuestActivation,
     mount: GuestSessionMount,
   ): Promise<RuntimeHostGuestAccessFinalization> => {
     activation.stage = 'connecting';
+    readiness.set(mount.mountId, activation.kind === 'import' ? 'connecting' : 'reconnecting');
     await input.mount(resolveMountTarget(mount), activation.controller.signal, (phase) => {
       if (activation.kind === 'import') {
         reportImportProgress(
@@ -227,18 +279,37 @@ export function createDesktopGuestSessionMountService(input: {
     if (activation.kind === 'import') {
       reportImportProgress(activation.onProgress, 'finalizing_access');
     }
-    const finalization = input.finalizeAccess(
-      mount.mountId,
-      activation.controller.signal,
-      activation.kind === 'import'
-        ? () => reportImportProgress(activation.onProgress, 'loading_session')
-        : undefined,
-    );
+    const finalization = (async (): Promise<RuntimeHostGuestAccessFinalization> => {
+      const result = await input.finalizeAccess(
+        mount.mountId,
+        activation.controller.signal,
+        () => {
+          activation.accessActivated = true;
+          if (activation.kind === 'import') {
+            reportImportProgress(activation.onProgress, 'loading_session');
+          }
+        },
+      );
+      activation.accessActivated = true;
+      activation.controller.signal.throwIfAborted();
+      if (result === 'ready') {
+        const session = await input.getSharedSession(mount.mountId);
+        activation.controller.signal.throwIfAborted();
+        if (!session) {
+          throw new RuntimeHostPermanentReconnectError(
+            'This shared Session is no longer available to the retained Guest access',
+          );
+        }
+        await recordSharedSession(mount, session);
+      } else {
+        readiness.set(mount.mountId, 'reconnecting');
+        activation.stage = 'connecting';
+      }
+      return result;
+    })();
     activation.finalization = finalization;
     try {
-      const result = await finalization;
-      activation.controller.signal.throwIfAborted();
-      return result;
+      return await finalization;
     } finally {
       if (activation.finalization === finalization) activation.finalization = undefined;
     }
@@ -255,6 +326,7 @@ export function createDesktopGuestSessionMountService(input: {
       controller: new AbortController(),
       mountId: mount.mountId,
       stage: 'connecting',
+      accessActivated: false,
       task: Promise.resolve(),
     };
     activations.add(activation);
@@ -263,8 +335,10 @@ export function createDesktopGuestSessionMountService(input: {
       while (!closed && !activation.controller.signal.aborted) {
         if (!(await load()).has(mount.mountId)) return;
         try {
-          await activate(activation, mount);
-          return;
+          const result = await activate(activation, mount);
+          if (result === 'ready') return;
+          await wait(delayMs, activation.controller.signal);
+          delayMs = Math.min(delayMs * 2, STARTUP_RETRY_MAX_MS);
         } catch (error) {
           if (
             closed ||
@@ -274,7 +348,11 @@ export function createDesktopGuestSessionMountService(input: {
           activation.stage = 'connecting';
           const failure = asError(error);
           onError(failure, mount);
-          if (failure instanceof RuntimeHostPermanentReconnectError) return;
+          if (failure instanceof RuntimeHostPermanentReconnectError) {
+            readiness.set(mount.mountId, 'unavailable');
+            return;
+          }
+          readiness.set(mount.mountId, 'reconnecting');
           await wait(delayMs, activation.controller.signal);
           delayMs = Math.min(delayMs * 2, STARTUP_RETRY_MAX_MS);
         }
@@ -311,6 +389,7 @@ export function createDesktopGuestSessionMountService(input: {
         return mount;
       });
       if (!removed) return;
+      readiness.delete(mountId);
       for (const activation of activations) {
         if (activation.mountId === mountId) {
           activation.controller.abort(new Error('Shared Session mount was removed'));
@@ -370,6 +449,7 @@ export function createDesktopGuestSessionMountService(input: {
       if (!(await load()).has(mount.mountId)) {
         throw new Error('Shared Session mount was removed while connecting');
       }
+      reconcile = finalization === 'reconnecting';
       return {
         kind: finalization === 'ready' ? 'connected' : 'recovering',
         mountId: mount.mountId,
@@ -377,9 +457,11 @@ export function createDesktopGuestSessionMountService(input: {
     } catch (error) {
       if (
         activation.stage === 'finalizing' &&
-        error instanceof RuntimeHostPairingFinalizationInterruptedError
+        (error instanceof RuntimeHostPairingFinalizationInterruptedError ||
+          (activation.accessActivated && !(error instanceof RuntimeHostPermanentReconnectError)))
       ) {
         reconcile = true;
+        readiness.set(mount.mountId, 'reconnecting');
       } else {
         await mutate(async () => {
           const next = new Map(await load());
@@ -388,6 +470,7 @@ export function createDesktopGuestSessionMountService(input: {
         });
         activation.controller.abort(new Error('Shared Session mount activation failed'));
         await input.unmount(mount.mountId).catch(() => undefined);
+        readiness.delete(mount.mountId);
       }
       return reconcile
         ? { kind: 'recovering', mountId: mount.mountId }
@@ -422,6 +505,7 @@ export function createDesktopGuestSessionMountService(input: {
       ...(onProgress ? { onProgress } : {}),
       controller: new AbortController(),
       stage: 'connecting',
+      accessActivated: false,
       task: Promise.resolve(),
     };
     activations.add(activation);
@@ -436,12 +520,32 @@ export function createDesktopGuestSessionMountService(input: {
     async start() {
       if (closed) return;
       const current = await mutate(load);
-      for (const mount of current.values()) beginStartupReconciliation(mount);
+      for (const mount of current.values()) {
+        readiness.set(mount.mountId, 'reconnecting');
+        beginStartupReconciliation(mount);
+      }
     },
 
     async list() {
       return [...(await mutate(load)).values()]
-        .map(({ mountId, name }) => ({ mountId, name }))
+        .map((mount) => {
+          const inspected = input.inspect?.(mount.mountId);
+          const serviceReadiness = readiness.get(mount.mountId) ?? 'reconnecting';
+          const currentReadiness: GuestSessionMountReadiness =
+            serviceReadiness === 'unavailable' || inspected?.readiness === 'unavailable'
+              ? 'unavailable'
+              : serviceReadiness === 'ready'
+                ? inspected?.readiness ?? 'ready'
+                : serviceReadiness;
+          return {
+            mountId: mount.mountId,
+            name: mount.name,
+            hostId: mount.rootId,
+            readiness: currentReadiness,
+            ...(inspected?.peerPath ? { peerPath: inspected.peerPath } : {}),
+            ...(mount.session ? { session: mount.session } : {}),
+          };
+        })
         .sort((left, right) => left.name.localeCompare(right.name));
     },
 
@@ -547,9 +651,11 @@ function decodeDocument(value: unknown): GuestSessionMountDocument {
 }
 
 function decodeMount(value: unknown): GuestSessionMount {
+  const keys = ['mountId', 'name', 'rootId', 'transport', 'credential'];
+  if (isRecord(value) && value.session !== undefined) keys.push('session');
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ['mountId', 'name', 'rootId', 'transport', 'credential']) ||
+    !hasExactKeys(value, keys) ||
     typeof value.credential !== 'string' ||
     !value.credential ||
     /\s/u.test(value.credential) ||
@@ -571,7 +677,17 @@ function decodeMount(value: unknown): GuestSessionMount {
     rootId: target.rootId,
     transport: target.transport,
     credential: value.credential,
+    ...(value.session === undefined
+      ? {}
+      : { session: retainedSession(decodeSharedSessionCatalogProjection(value.session)) }),
   };
+}
+
+function retainedSession(
+  session: SharedSessionCatalogProjection,
+): SharedSessionCatalogProjection {
+  const { liveRunState: _liveRunState, ...retained } = session;
+  return retained;
 }
 
 function isPeerPathUnavailable(error: unknown): boolean {
