@@ -948,10 +948,9 @@ describe('history compact checkpoint', () => {
       readEventProjection: async () => {
         throw new Error('damaged projection');
       },
-      listSessionRuns: async () => {
+      readEvents: async () => {
         throw new Error('ledger recovery failed');
       },
-      readEvents: async () => [],
     };
 
     await assert.rejects(

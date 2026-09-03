@@ -1684,11 +1684,20 @@ describe('the shipped runtime default drives the proactive long-turn journey (is
     assert.equal((anchorOf(finalization)?.payloadChars ?? 0) < BIG_ACTIVE_TOOL_SCHEMA_CHARS, true);
   });
 
-  test('an anchor is discarded unless a run header proves it came from this model', async () => {
+  test('an anchor is discarded unless its invocation proves it came from this model', async () => {
     // Input tokens are a count in one model's tokenizer; nothing converts them.
-    // A header naming another model and no header at all fail the same way.
+    // An opening naming another model and no invocation at all fail the same way.
+    const otherModel = priorRunInvocation();
     for (const priorInvocations of [
-      [{ ...priorRunInvocation(), modelId: 'some-other-model' }],
+      [
+        {
+          ...otherModel,
+          opening: {
+            ...otherModel.opening,
+            route: { ...otherModel.opening.route, modelId: 'some-other-model' },
+          },
+        },
+      ],
       [],
     ]) {
       const fixture = buildFixture({
