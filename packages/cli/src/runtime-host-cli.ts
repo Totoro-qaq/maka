@@ -22,9 +22,11 @@ import {
   isProductReleaseVersion,
   isSha512PackageIntegrity,
 } from '@maka/runtime-host/operator/update-package-evidence';
-import type { RuntimeHostManagedUpdatePolicy } from '@maka/runtime-host/operator';
 import {
+  decodeRuntimeHostPosixOperatorCommand,
   decodeRuntimeHostWebRtcStunPolicy,
+  type RuntimeHostManagedUpdatePolicy,
+  type RuntimeHostPosixOperatorCommand,
   type RuntimeHostWebRtcStunPolicy,
 } from '@maka/runtime-host/operator';
 import {
@@ -364,7 +366,7 @@ export type RuntimeHostCliCommand =
       id: string;
       name: string;
       distribution: string;
-      operatorPath: string;
+      operator: RuntimeHostPosixOperatorCommand;
       expectedRootId: string;
     }
   | { kind: 'runtime-host-profile-remove'; id: string }
@@ -1708,7 +1710,7 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
   let sshWebSocketPath = '/runtime-host';
   let sshWebSocketPathConfigured = false;
   let wslDistribution: string | undefined;
-  let operatorPath: string | undefined;
+  let operator: RuntimeHostPosixOperatorCommand | undefined;
   let expectedRootId: string | undefined;
   let credentialEnv: string | undefined;
   for (let index = 1; index < argv.length; index += 1) {
@@ -1723,7 +1725,7 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       argument !== '--ssh-remote-port' &&
       argument !== '--ssh-websocket-path' &&
       argument !== '--wsl-distribution' &&
-      argument !== '--operator-path' &&
+      argument !== '--operator-command' &&
       argument !== '--expected-root' &&
       argument !== '--credential-env' &&
       argument !== '--acknowledge-plaintext'
@@ -1748,7 +1750,13 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       sshWebSocketPathConfigured = true;
     }
     if (argument === '--wsl-distribution') wslDistribution = parsed;
-    if (argument === '--operator-path') operatorPath = parsed;
+    if (argument === '--operator-command') {
+      try {
+        operator = decodeRuntimeHostPosixOperatorCommand(JSON.parse(parsed));
+      } catch {
+        return error('--operator-command must be a valid Runtime Host operator command JSON value');
+      }
+    }
     if (argument === '--expected-root') expectedRootId = parsed;
     if (argument === '--credential-env') credentialEnv = parsed;
     index += 1;
@@ -1766,11 +1774,11 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       'exactly one of --tls-url, --plaintext-url, --ssh-destination, or --wsl-distribution is required',
     );
   }
-  if (wslDistribution && !operatorPath) {
-    return error('--wsl-distribution requires --operator-path');
+  if (wslDistribution && !operator) {
+    return error('--wsl-distribution requires --operator-command');
   }
-  if (!wslDistribution && operatorPath) {
-    return error('--operator-path requires --wsl-distribution');
+  if (!wslDistribution && operator) {
+    return error('--operator-command requires --wsl-distribution');
   }
   if (wslDistribution && credentialEnv) {
     return error('WSL environment profiles do not accept --credential-env');
@@ -1806,7 +1814,7 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       id,
       name,
       distribution: wslDistribution,
-      operatorPath: operatorPath!,
+      operator: operator!,
       expectedRootId,
     };
   }
