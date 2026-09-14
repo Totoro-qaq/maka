@@ -192,6 +192,7 @@ export interface WorkbarAttachmentsService {
     | { ok: true; base64: string; mimeType: string }
     | { ok: false; reason: string }
   >;
+  detectDirectories?(files: readonly File[]): Promise<readonly boolean[]>;
 }
 
 export interface WorkbarWorkBoardService {
