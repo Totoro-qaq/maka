@@ -1786,6 +1786,29 @@ test('keeps the generic send failure for a steer refused for any other reason', 
   );
 });
 
+async function firstSendAgainst(result: Awaited<ReturnType<WorkbarServices['sideChat']['send']>>) {
+  const { container, send } = await renderOwnershipProbe({ send: async () => result });
+  await act(async () => {
+    assert.equal(await send('see this folder'), false);
+    await Promise.resolve();
+  });
+  return container.firstElementChild?.getAttribute('data-error');
+}
+
+test('names the attachment rule when the Host refuses the first send for an attachment (#5279)', async () => {
+  assert.equal(
+    await firstSendAgainst({ ok: false, reason: 'attachment_blocked', code: 'item_unreadable' }),
+    getShellCopy('en').sessionSettingsActions.attachmentIngestBlocked.item_unreadable,
+  );
+});
+
+test('keeps the generic rejection for a first send refused for any other reason', async () => {
+  assert.equal(
+    await firstSendAgainst({ ok: false, reason: 'skill_invocation_failed' }),
+    getDesktopConversationCopy('en').quoteCompanion.errors.sendRejected,
+  );
+});
+
 test('stops the active Side Conversation after retracting its queued steer', async () => {
   const pendingSteer = deferred<{ kind: 'queued' }>();
   let admissionId: string | undefined;

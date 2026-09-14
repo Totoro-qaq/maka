@@ -49,13 +49,13 @@ import type { ClientCapabilityResponse } from '@maka/core/client-capability-gran
 import type { PermissionMode } from '@maka/core/permission';
 import type { SessionSummary, StoredMessage } from '@maka/core/session';
 import type { UiLocale } from '@maka/core/ui-locale';
-import { AttachmentIngestBlockedError } from '@maka/core/attachments';
+import { AttachmentIngestBlockedError, type AttachmentIngestBlockedCode } from '@maka/core/attachments';
 import type { ChatModelChoice } from '@maka/core/chat-model-choice';
 import type { UserQuestionResponse } from '@maka/core/user-question';
 import type { InteractionFormResponse } from '@maka/core/interaction';
 import type { ContextCompactResult } from '@maka/runtime-host/protocol';
 import { useWorkbarServices } from '../../services-context.js';
-import { localizedShellErrorMessage } from '../../../../locales/shell-copy.js';
+import { getShellCopy } from '../../../../locales/shell-copy.js';
 import type { WorkbarIngestInput } from '../../ports.js';
 import {
   abandonPendingCompanionCopy,
@@ -270,6 +270,11 @@ function transcriptRecordsTerminalTurn(
  * from the owning source session), which removes the ephemeral fork. Workbar
  * collapse and New Tab navigation keep the panel mounted.
  */
+/** The main composer's copy for an attachment the send path refused. */
+function attachmentBlockedMessage(code: AttachmentIngestBlockedCode, locale: UiLocale): string {
+  return getShellCopy(locale).sessionSettingsActions.attachmentIngestBlocked[code];
+}
+
 export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompanionResult {
   const { sideChat } = useWorkbarServices();
   const {
@@ -1302,7 +1307,11 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
           send_failed: errors.sendFailed,
           send_rejected: errors.sendRejected,
         };
-        setError(byCode[result.code]);
+        setError(
+          result.attachmentBlocked
+            ? attachmentBlockedMessage(result.attachmentBlocked, localeRef.current)
+            : byCode[result.code],
+        );
         activeTurnIdRef.current = null;
         releaseAdmission(admission);
       }
@@ -1481,7 +1490,7 @@ export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompan
         // inviting a retry.
         const message =
           failure instanceof AttachmentIngestBlockedError
-            ? localizedShellErrorMessage(failure, copyRef.current.errors.sendFailed, localeRef.current)
+            ? attachmentBlockedMessage(failure.code, localeRef.current)
             : copyRef.current.errors.sendFailed;
         if (placement === 'current_turn' && pendingAdmissionRef.current === admission) {
           releaseAdmission(admission, message);
