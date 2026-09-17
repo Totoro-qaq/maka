@@ -131,9 +131,13 @@ function redactAssignedSecrets(value: string): string {
     // A value that starts inside the last redacted value ends with it.
     if (valueStart < copied) continue;
     ASSIGNED_SECRET_VALUE_PATTERN.lastIndex = valueStart;
-    ASSIGNED_SECRET_VALUE_PATTERN.test(value);
+    const valueMatch = ASSIGNED_SECRET_VALUE_PATTERN.exec(value);
+    // The prefix lookahead promises a value here. Should the two patterns ever
+    // disagree, skip: a failed sticky match resets lastIndex, and copying from
+    // there would echo the value after its marker.
+    if (!valueMatch) continue;
     next += `${value.slice(copied, valueStart)}[redacted]`;
-    copied = ASSIGNED_SECRET_VALUE_PATTERN.lastIndex;
+    copied = valueStart + valueMatch[0].length;
   }
   return next + value.slice(copied);
 }

@@ -313,12 +313,14 @@ describe('redactSecrets', () => {
       `note: ${'a:'.repeat(100_000)}`,
       `data=${'a-'.repeat(100_000)}`,
       `blob=${'Z'.repeat(200_000)}==`,
+      'a-'.repeat(100_000),
     ]) {
       assert.equal(redactSecrets(text), text);
     }
     const elapsed = Date.now() - started;
-    // Rescanning the rest of the value per nested key or per hyphen, or splitting
-    // a long uppercase key with backtracking, takes seconds to tens of seconds.
+    // Rescanning the rest of the value per nested key or per hyphen, retrying a
+    // key at every hyphen of a bare run, or splitting a long uppercase key with
+    // backtracking takes seconds to tens of seconds.
     assert.ok(elapsed < 5_000, `scanned in ${elapsed}ms, which must not rescan the value`);
   });
 
