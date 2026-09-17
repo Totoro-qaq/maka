@@ -47,6 +47,8 @@ export interface CommandCodeLoginIpcDeps {
 
 const MAX_BASE_URL_CHARS = 2_048;
 const MAX_ATTEMPT_ID_CHARS = 128;
+/** Chromium's net::ERR_ABORTED: a cancelled load, which commits no error page. */
+const NET_ERR_ABORTED = -3;
 
 export function registerCommandCodeLoginIpc(deps: CommandCodeLoginIpcDeps): void {
   // The controller outlives every renderer, and crash recovery and the error
@@ -83,16 +85,18 @@ export function registerCommandCodeLoginIpc(deps: CommandCodeLoginIpcDeps): void
         if (isMainFrame) abandon();
       };
       // A reload that fails, say while the dev server is down, commits an error
-      // page instead. Electron reports only that commit here: a load that is
-      // stopped, blocked, or turned into a download keeps the document.
+      // page instead. A load that is stopped, prevented by will-navigate, or
+      // turned into a download keeps the document. Electron 43 reports nothing
+      // here for such a load, though its documentation describes this event for
+      // one window.stop() cancels, which Chromium fails with net::ERR_ABORTED.
       const onErrorPageCommitted = (
         _event: Event,
-        _errorCode: number,
+        errorCode: number,
         _errorDescription: string,
         _validatedURL: string,
         isMainFrame: boolean,
       ): void => {
-        if (isMainFrame) abandon();
+        if (isMainFrame && errorCode !== NET_ERR_ABORTED) abandon();
       };
       event.sender.once('render-process-gone', abandon);
       event.sender.once('destroyed', abandon);

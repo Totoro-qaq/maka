@@ -32,6 +32,7 @@ import {
   registerCommandCodeLoginIpc,
   type CommandCodeLoginIpcDeps,
 } from '../commandcode-login-ipc-main.js';
+import { IPC_SUITE_PORTS } from './commandcode-login-test-ports.js';
 
 type Handler = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown;
 
@@ -54,10 +55,12 @@ function listeners(sender: EventEmitter): Record<string, number> {
 type Navigation =
   | 'reload'
   | 'error-page'
+  | 'refused-error-page'
   | 'same-document'
   | 'subframe'
   | 'subframe-error-page'
-  | 'blocked';
+  | 'blocked'
+  | 'cancelled';
 
 /**
  * What Electron 43 emits on a renderer's WebContents for each navigation, as a
@@ -65,7 +68,10 @@ type Navigation =
  * commits a new main-frame document, which is an error page when that load
  * fails: a hash or pushState route keeps the document, a subframe commits its
  * own, and a navigation that will-navigate prevents never commits. Neither
- * does one that is stopped, answers 204 or becomes a download.
+ * does one that is stopped, answers 204 or becomes a download, and Electron 43
+ * emits nothing more for those. Only `cancelled` was not reported: it models
+ * the did-fail-provisional-load Electron documents for a load that
+ * window.stop() cancels, with Chromium's net::ERR_ABORTED.
  */
 function navigate(sender: EventEmitter, navigation: Navigation): void {
   const isMainFrame = !navigation.startsWith('subframe');
@@ -81,12 +87,21 @@ function navigate(sender: EventEmitter, navigation: Navigation): void {
     1,
   );
   if (navigation === 'blocked') return;
+  if (navigation === 'cancelled') {
+    // Electron leaves out did-fail-load for an aborted load.
+    sender.emit('did-fail-provisional-load', {}, -3, 'ERR_ABORTED', url, isMainFrame, 4, 1);
+    return;
+  }
   if (isSameDocument) {
     sender.emit('did-navigate-in-page', {}, url, isMainFrame, 4, 1);
     return;
   }
   if (navigation.endsWith('error-page')) {
-    const failure = [-6, 'ERR_FILE_NOT_FOUND', url, isMainFrame, 5, 4] as const;
+    // A missing file, or a dev server that is down.
+    const failure =
+      navigation === 'refused-error-page'
+        ? ([-102, 'ERR_CONNECTION_REFUSED', url, isMainFrame, 5, 4] as const)
+        : ([-6, 'ERR_FILE_NOT_FOUND', url, isMainFrame, 5, 4] as const);
     sender.emit('did-fail-provisional-load', {}, ...failure);
     sender.emit('did-fail-load', {}, ...failure);
     return;
@@ -192,13 +207,14 @@ describe('registerCommandCodeLoginIpc', () => {
     navigate(sender, 'subframe');
     navigate(sender, 'subframe-error-page');
     navigate(sender, 'blocked');
+    navigate(sender, 'cancelled');
     assert.deepEqual(calls, [], 'the document that started the login is still there');
     assert.deepEqual(listeners(sender), observed);
 
     // The error boundary reloads without replacing the WebContents, and a
     // reload that fails leaves an error page. Each new document is a new owner,
     // observed once however many starts it sends.
-    for (const reload of ['reload', 'error-page', 'reload', 'error-page'] as const) {
+    for (const reload of ['reload', 'error-page', 'reload', 'refused-error-page'] as const) {
       navigate(sender, reload);
       assert.deepEqual(calls.splice(0), [['abandonOwner', 'web-contents:9']]);
       assert.deepEqual(listeners(sender), {});
@@ -240,8 +256,7 @@ describe('registerCommandCodeLoginIpc', () => {
 // renderer's WebContents are stand-ins.
 
 const STATE = 'ipc-state-token';
-// Off the CLI's range, and off the controller suite's, which runs beside this file.
-const START_PORT = 46_979;
+const START_PORT = IPC_SUITE_PORTS.startPort;
 const controllers: CommandCodeBrowserLoginController[] = [];
 
 afterEach(() => {
@@ -260,8 +275,7 @@ function wired(options: { holdBrowser?: boolean; timeoutMs?: number } = {}) {
       opening.push({ url, gate });
       return gate.promise;
     },
-    startPort: START_PORT,
-    maxPortAttempts: 10,
+    ...IPC_SUITE_PORTS,
     randomToken: () => STATE,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
   });
@@ -312,11 +326,20 @@ function postApproved(callback: URL) {
 }
 
 /** How the document that started a login goes away. */
-const DEPARTURES = ['render-process-gone', 'destroyed', 'reload', 'error-page'] as const;
+const DEPARTURES = [
+  'render-process-gone',
+  'destroyed',
+  'reload',
+  'error-page',
+  'refused-error-page',
+] as const;
 
 function leave(renderer: EventEmitter, departure: (typeof DEPARTURES)[number]): void {
-  if (departure === 'reload' || departure === 'error-page') navigate(renderer, departure);
-  else renderer.emit(departure, {}, { reason: 'crashed', exitCode: 1 });
+  if (departure === 'render-process-gone' || departure === 'destroyed') {
+    renderer.emit(departure, {}, { reason: 'crashed', exitCode: 1 });
+  } else {
+    navigate(renderer, departure);
+  }
 }
 
 describe('registerCommandCodeLoginIpc with the login controller', () => {
@@ -358,7 +381,13 @@ describe('registerCommandCodeLoginIpc with the login controller', () => {
     });
   }
 
-  for (const navigation of ['same-document', 'subframe', 'subframe-error-page', 'blocked'] as const) {
+  for (const navigation of [
+    'same-document',
+    'subframe',
+    'subframe-error-page',
+    'blocked',
+    'cancelled',
+  ] as const) {
     test(`a ${navigation} navigation leaves the attempt to finish`, async () => {
       const { controller, start, complete } = wired();
       const renderer = webContents(9);
