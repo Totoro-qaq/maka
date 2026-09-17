@@ -234,7 +234,8 @@ export class CommandCodeBrowserLoginController {
   }
 
   /**
-   * Abandons every attempt `ownerId` started. Its renderer is gone, so no
+   * Abandons every attempt `ownerId` started. The document that started them
+   * is gone (its renderer crashed or was destroyed, or it was reloaded), so no
    * `complete()` or `cancel()` will arrive for them; a start still binding or
    * opening the browser gives up its port here too. A `complete()` already
    * waiting settles as it would for `cancel()`.

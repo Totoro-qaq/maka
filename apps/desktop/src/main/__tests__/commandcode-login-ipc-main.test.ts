@@ -35,13 +35,64 @@ import {
 
 type Handler = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown;
 
-/** A renderer's WebContents: its id and the lifecycle events main observes. */
+/** A renderer's WebContents: its id and the lifecycle and navigation events main observes. */
 function webContents(id: number) {
   return Object.assign(new EventEmitter(), { id });
 }
 
 function eventFrom(sender: EventEmitter): IpcMainInvokeEvent {
   return { sender } as unknown as IpcMainInvokeEvent;
+}
+
+/** The listeners main holds on a renderer, by event name. */
+function listeners(sender: EventEmitter): Record<string, number> {
+  return Object.fromEntries(
+    sender.eventNames().map((name) => [String(name), sender.listenerCount(name)]),
+  );
+}
+
+type Navigation =
+  | 'reload'
+  | 'error-page'
+  | 'same-document'
+  | 'subframe'
+  | 'subframe-error-page'
+  | 'blocked';
+
+/**
+ * What Electron 43 emits on a renderer's WebContents for each navigation, as a
+ * hidden BrowserWindow reported it. Only a reload, or a load of another page,
+ * commits a new main-frame document, which is an error page when that load
+ * fails: a hash or pushState route keeps the document, a subframe commits its
+ * own, and a navigation that will-navigate prevents never commits. Neither
+ * does one that is stopped, answers 204 or becomes a download.
+ */
+function navigate(sender: EventEmitter, navigation: Navigation): void {
+  const isMainFrame = !navigation.startsWith('subframe');
+  const isSameDocument = navigation === 'same-document';
+  const url = isSameDocument ? 'file:///app/index.html#/settings' : 'file:///app/index.html';
+  sender.emit(
+    'did-start-navigation',
+    { url, isSameDocument, isMainFrame, frame: null, initiator: null },
+    url,
+    isSameDocument,
+    isMainFrame,
+    4,
+    1,
+  );
+  if (navigation === 'blocked') return;
+  if (isSameDocument) {
+    sender.emit('did-navigate-in-page', {}, url, isMainFrame, 4, 1);
+    return;
+  }
+  if (navigation.endsWith('error-page')) {
+    const failure = [-6, 'ERR_FILE_NOT_FOUND', url, isMainFrame, 5, 4] as const;
+    sender.emit('did-fail-provisional-load', {}, ...failure);
+    sender.emit('did-fail-load', {}, ...failure);
+    return;
+  }
+  sender.emit('did-frame-navigate', {}, url, 200, 'OK', isMainFrame, 4, 8);
+  if (isMainFrame) sender.emit('did-navigate', {}, url, 200, 'OK');
 }
 
 function harness() {
@@ -111,19 +162,51 @@ describe('registerCommandCodeLoginIpc', () => {
     const { calls, invoke, sender } = harness();
     await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.complete, 'a1');
     await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.cancel, 'a1');
-    assert.equal(sender.listenerCount('destroyed'), 0, 'only a start makes the renderer an owner');
+    assert.deepEqual(listeners(sender), {}, 'only a start makes the renderer an owner');
 
     await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.start, {});
     await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.start, {});
-    assert.equal(sender.listenerCount('render-process-gone'), 1);
-    assert.equal(sender.listenerCount('destroyed'), 1);
+    assert.deepEqual(listeners(sender), {
+      'render-process-gone': 1,
+      destroyed: 1,
+      'did-frame-navigate': 1,
+      'did-fail-provisional-load': 1,
+    });
     calls.splice(0);
 
     sender.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
     sender.emit('destroyed');
+    navigate(sender, 'reload');
+    navigate(sender, 'error-page');
     assert.deepEqual(calls, [['abandonOwner', 'web-contents:9']]);
-    assert.equal(sender.listenerCount('render-process-gone'), 0);
-    assert.equal(sender.listenerCount('destroyed'), 0);
+    assert.deepEqual(listeners(sender), {});
+  });
+
+  test('a document the renderer replaces abandons the attempts it started', async () => {
+    const { calls, invoke, sender } = harness();
+    await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.start, {});
+    const observed = listeners(sender);
+    calls.splice(0);
+
+    navigate(sender, 'same-document');
+    navigate(sender, 'subframe');
+    navigate(sender, 'subframe-error-page');
+    navigate(sender, 'blocked');
+    assert.deepEqual(calls, [], 'the document that started the login is still there');
+    assert.deepEqual(listeners(sender), observed);
+
+    // The error boundary reloads without replacing the WebContents, and a
+    // reload that fails leaves an error page. Each new document is a new owner,
+    // observed once however many starts it sends.
+    for (const reload of ['reload', 'error-page', 'reload', 'error-page'] as const) {
+      navigate(sender, reload);
+      assert.deepEqual(calls.splice(0), [['abandonOwner', 'web-contents:9']]);
+      assert.deepEqual(listeners(sender), {});
+      await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.start, {});
+      await invoke(COMMANDCODE_LOGIN_IPC_CHANNELS.start, {});
+      calls.splice(0);
+      assert.deepEqual(listeners(sender), observed);
+    }
   });
 
   test('complete requires a bounded attempt id and otherwise reports superseded', async () => {
@@ -228,28 +311,36 @@ function postApproved(callback: URL) {
   });
 }
 
+/** How the document that started a login goes away. */
+const DEPARTURES = ['render-process-gone', 'destroyed', 'reload', 'error-page'] as const;
+
+function leave(renderer: EventEmitter, departure: (typeof DEPARTURES)[number]): void {
+  if (departure === 'reload' || departure === 'error-page') navigate(renderer, departure);
+  else renderer.emit(departure, {}, { reason: 'crashed', exitCode: 1 });
+}
+
 describe('registerCommandCodeLoginIpc with the login controller', () => {
-  for (const lifecycleEvent of ['render-process-gone', 'destroyed'] as const) {
-    test(`${lifecycleEvent} while start() opens the browser drops the attempt and its port`, async () => {
+  for (const departure of DEPARTURES) {
+    test(`${departure} while start() opens the browser drops the attempt and its port`, async () => {
       const { controller, opening, start } = wired({ holdBrowser: true });
       const renderer = webContents(9);
       const starting = start(renderer);
       await waitFor(() => opening.length === 1, { timeoutMs: 2_000 });
       const callback = callbackOf(opening[0]!.url);
 
-      renderer.emit(lifecycleEvent, {}, { reason: 'crashed', exitCode: 1 });
-      await assert.rejects(postApproved(callback), 'the listener goes with its renderer');
-      assert.equal(renderer.listenerCount('render-process-gone'), 0);
-      assert.equal(renderer.listenerCount('destroyed'), 0);
+      leave(renderer, departure);
+      await assert.rejects(postApproved(callback), 'the listener goes with its document');
+      assert.deepEqual(listeners(renderer), {});
 
-      // The reply goes to a frame that is gone, so nothing will complete or
+      // The reply goes to a document that is gone, so nothing will complete or
       // cancel the attempt.
       opening[0]!.gate.resolve();
       await starting;
       assert.equal(controller.attemptCount(), 0);
 
-      // Crash recovery reloads the same WebContents; a destroyed one is replaced.
-      const recovered = lifecycleEvent === 'render-process-gone' ? renderer : webContents(10);
+      // Crash recovery and a reload keep the same WebContents; a destroyed one
+      // is replaced.
+      const recovered = departure === 'destroyed' ? webContents(10) : renderer;
       const restarting = start(recovered);
       await waitFor(() => opening.length === 2, { timeoutMs: 2_000 });
       opening[1]!.gate.resolve();
@@ -258,8 +349,29 @@ describe('registerCommandCodeLoginIpc with the login controller', () => {
       if (!restarted.ok) throw new Error('unreachable');
       assert.equal(Number(callbackOf(restarted.authUrl).port), START_PORT, 'the port was released');
       assert.equal(controller.attemptCount(), 1);
-      assert.equal(recovered.listenerCount('render-process-gone'), 1);
-      assert.equal(recovered.listenerCount('destroyed'), 1);
+      assert.deepEqual(listeners(recovered), {
+        'render-process-gone': 1,
+        destroyed: 1,
+        'did-frame-navigate': 1,
+        'did-fail-provisional-load': 1,
+      });
+    });
+  }
+
+  for (const navigation of ['same-document', 'subframe', 'subframe-error-page', 'blocked'] as const) {
+    test(`a ${navigation} navigation leaves the attempt to finish`, async () => {
+      const { controller, start, complete } = wired();
+      const renderer = webContents(9);
+      const started = await start(renderer);
+      assert.equal(started.ok, true, JSON.stringify(started));
+      if (!started.ok) throw new Error('unreachable');
+      const completion = complete(renderer, started.attemptId);
+
+      navigate(renderer, navigation);
+      assert.equal(controller.attemptCount(), 1);
+      assert.equal((await postApproved(callbackOf(started.authUrl))).status, 200);
+      assert.equal((await completion).ok, true);
+      assert.equal(controller.attemptCount(), 0);
     });
   }
 
@@ -279,21 +391,23 @@ describe('registerCommandCodeLoginIpc with the login controller', () => {
     assert.equal(Number(callbackOf(restarted.authUrl).port), START_PORT, 'the port was released');
   });
 
-  test('a complete() already waiting settles as cancelled when its renderer goes', async () => {
-    // A short window, so a controller that kept the attempt settles it as a
-    // timeout instead of holding the suite for two minutes.
-    const { controller, start, complete } = wired({ timeoutMs: 500 });
-    const renderer = webContents(9);
-    const started = await start(renderer);
-    assert.equal(started.ok, true, JSON.stringify(started));
-    if (!started.ok) throw new Error('unreachable');
-    const completion = complete(renderer, started.attemptId);
+  for (const departure of DEPARTURES) {
+    test(`a complete() already waiting settles as cancelled on ${departure}`, async () => {
+      // A short window, so a controller that kept the attempt settles it as a
+      // timeout instead of holding the suite for two minutes.
+      const { controller, start, complete } = wired({ timeoutMs: 500 });
+      const renderer = webContents(9);
+      const started = await start(renderer);
+      assert.equal(started.ok, true, JSON.stringify(started));
+      if (!started.ok) throw new Error('unreachable');
+      const completion = complete(renderer, started.attemptId);
 
-    renderer.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
-    assert.deepEqual(await completion, { ok: false, reason: 'cancelled' });
-    assert.equal(controller.attemptCount(), 0);
-    await assert.rejects(postApproved(callbackOf(started.authUrl)));
-  });
+      leave(renderer, departure);
+      assert.deepEqual(await completion, { ok: false, reason: 'cancelled' });
+      assert.equal(controller.attemptCount(), 0);
+      await assert.rejects(postApproved(callbackOf(started.authUrl)));
+    });
+  }
 
   test("another renderer going away leaves this renderer's attempt to finish", async () => {
     const { controller, start, complete } = wired();
