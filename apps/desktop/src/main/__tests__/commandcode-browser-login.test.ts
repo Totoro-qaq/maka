@@ -337,6 +337,27 @@ describe('CommandCodeBrowserLoginController', () => {
     assert.equal(controller.attemptCount(), 0);
   });
 
+  test('abandoning an owner drops the attempts it started and nothing else', async () => {
+    const controller = makeController();
+    // Superseded and never collected: one owned, one started without an owner.
+    assert.equal((await controller.start({}, 'renderer-a')).ok, true);
+    await startOk(controller);
+    const live = await controller.start({}, 'renderer-b');
+    assert.equal(live.ok, true, JSON.stringify(live));
+    if (!live.ok) throw new Error('unreachable');
+    const completion = controller.complete(live.attemptId);
+
+    controller.abandonOwner('renderer-c');
+    assert.equal(controller.attemptCount(), 3);
+    controller.abandonOwner('renderer-a');
+    assert.equal(controller.attemptCount(), 2);
+    controller.abandonOwner('renderer-b');
+    assert.deepEqual(await completion, { ok: false, reason: 'cancelled' });
+    const callback = new URL(new URL(live.authUrl).searchParams.get('callback') ?? '');
+    await assert.rejects(post(callback.toString(), APPROVED), 'the port goes with its owner');
+    assert.equal(controller.attemptCount(), 1, 'an attempt without an owner is left to its caller');
+  });
+
   test('a new start supersedes the live attempt and rebinds the same port', async () => {
     const controller = makeController();
     const first = await startOk(controller);

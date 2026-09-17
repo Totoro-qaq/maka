@@ -17,7 +17,7 @@
  * under the License.
  */
 
-import type { IpcMain } from 'electron';
+import type { IpcMain, IpcMainInvokeEvent } from 'electron';
 import type {
   CommandCodeBrowserLoginController,
   CommandCodeBrowserLoginResult,
@@ -39,17 +39,42 @@ export const COMMANDCODE_LOGIN_IPC_CHANNELS = {
  */
 export interface CommandCodeLoginIpcDeps {
   readonly ipcMain: Pick<IpcMain, 'handle'>;
-  readonly controller: Pick<CommandCodeBrowserLoginController, 'start' | 'complete' | 'cancel'>;
+  readonly controller: Pick<
+    CommandCodeBrowserLoginController,
+    'start' | 'complete' | 'cancel' | 'abandonOwner'
+  >;
 }
 
 const MAX_BASE_URL_CHARS = 2_048;
 const MAX_ATTEMPT_ID_CHARS = 128;
 
 export function registerCommandCodeLoginIpc(deps: CommandCodeLoginIpcDeps): void {
+  // The controller outlives every renderer, and crash recovery reloads the
+  // same WebContents without destroying it. A renderer that goes away mid-login
+  // never sends the complete() or cancel() that would release its attempt.
+  const observedOwners = new Set<string>();
+  const bindOwner = (event: IpcMainInvokeEvent): string => {
+    const ownerId = `web-contents:${event.sender.id}`;
+    if (!observedOwners.has(ownerId)) {
+      observedOwners.add(ownerId);
+      // Whichever event comes first detaches both, so this runs once per
+      // observation; a recovered renderer's next start observes it afresh.
+      const abandon = () => {
+        observedOwners.delete(ownerId);
+        event.sender.removeListener('render-process-gone', abandon);
+        event.sender.removeListener('destroyed', abandon);
+        deps.controller.abandonOwner(ownerId);
+      };
+      event.sender.once('render-process-gone', abandon);
+      event.sender.once('destroyed', abandon);
+    }
+    return ownerId;
+  };
+
   deps.ipcMain.handle(
     COMMANDCODE_LOGIN_IPC_CHANNELS.start,
-    (_event, raw: unknown): Promise<CommandCodeBrowserLoginStartResult> =>
-      deps.controller.start(decodeStartInput(raw)),
+    (event, raw: unknown): Promise<CommandCodeBrowserLoginStartResult> =>
+      deps.controller.start(decodeStartInput(raw), bindOwner(event)),
   );
   deps.ipcMain.handle(
     COMMANDCODE_LOGIN_IPC_CHANNELS.complete,
