@@ -188,13 +188,15 @@ function buildReadArtifactTool(deps: BuildDeepResearchToolsDeps): MakaTool<
       'Use artifact ids from deep_research_status to recover evidence after interruption or restart.',
     parameters: z.object({
       artifact_id: stableIdSchema.describe('Research artifact id from the current workspace.'),
+      // Unbounded above: redaction can make the text longer than the stored body.
       offset_chars: z
         .number()
         .int()
         .min(0)
-        .max(DEEP_RESEARCH_ARTIFACT_CONTENT_MAX_CHARS)
         .optional()
-        .describe('Zero-based character offset for chunked reads.'),
+        .describe(
+          "Zero-based character offset for chunked reads. Counts characters of the redacted text this tool returns; pass the previous read's end to continue.",
+        ),
       max_chars: z
         .number()
         .int()
@@ -226,14 +228,17 @@ function buildReadArtifactTool(deps: BuildDeepResearchToolsDeps): MakaTool<
       }
       const offset = input.offset_chars ?? 0;
       const maxChars = input.max_chars ?? DEEP_RESEARCH_ARTIFACT_READ_DEFAULT_CHARS;
+      // Redact the whole artifact before selecting the window: a secret split by
+      // a page boundary matches in neither page. Offsets count the redacted view.
+      const content = safeResearchArtifactContent(read.text);
       const selected: string[] = [];
       let total = 0;
-      for (const character of read.text) {
+      for (const character of content) {
         if (total >= offset && total < offset + maxChars) selected.push(character);
         total += 1;
       }
       const end = Math.min(total, offset + maxChars);
-      const chunk = safeResearchArtifactContent(selected.join(''));
+      const chunk = selected.join('');
       return [
         `<deep-research-artifact id="${ref.artifactId}" role="${ref.role}" offset="${offset}" end="${end}" total="${total}">`,
         `Name: ${normalizeInlineText(ref.name)}`,

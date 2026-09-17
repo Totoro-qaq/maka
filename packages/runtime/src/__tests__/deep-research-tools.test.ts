@@ -27,6 +27,9 @@ import type { ArtifactRecord } from '@maka/core/artifacts';
 import type { DeepResearchRun } from '@maka/core/deep-research-run';
 import { createSqliteDeepResearchStore } from '@maka/storage/deep-research-store';
 import {
+  DEEP_RESEARCH_ARTIFACT_CONTENT_MAX_CHARS,
+  DEEP_RESEARCH_ARTIFACT_READ_DEFAULT_CHARS,
+  DEEP_RESEARCH_ARTIFACT_READ_MAX_CHARS,
   DEEP_RESEARCH_CHECKPOINT_TOOL_NAME,
   DEEP_RESEARCH_COMPLETE_TOOL_NAME,
   DEEP_RESEARCH_READ_ARTIFACT_TOOL_NAME,
@@ -124,6 +127,80 @@ async function withTempRoot(fn: (root: string) => Promise<void>): Promise<void> 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+interface ArtifactPage {
+  offset: number;
+  end: number;
+  total: number;
+  body: string;
+}
+
+async function withSavedSources(
+  contents: readonly string[],
+  fn: (tools: MakaTool[], artifactIds: string[]) => Promise<void>,
+): Promise<void> {
+  await withTempRoot(async (root) => {
+    const artifactStore = new FakeArtifactStore();
+    const tools = buildDeepResearchTools({
+      store: createSqliteDeepResearchStore(root),
+      artifactStore,
+    });
+    await execute(
+      tools,
+      DEEP_RESEARCH_START_TOOL_NAME,
+      { objective: 'Page through archived sources that quote credentials.' },
+      'call-start-pages',
+    );
+    for (const [index, content] of contents.entries()) {
+      await execute(
+        tools,
+        DEEP_RESEARCH_SAVE_ARTIFACT_TOOL_NAME,
+        {
+          role: 'source',
+          name: `source-${index}.md`,
+          content,
+          summary: 'Archived source quoting credentials.',
+          locator: `https://example.com/source-${index}`,
+        },
+        `call-source-page-${index}`,
+      );
+    }
+    await fn(
+      tools,
+      artifactStore.records.map((record) => record.id),
+    );
+  });
+}
+
+async function readArtifactPage(
+  tools: MakaTool[],
+  artifactId: string,
+  window: { offset_chars?: number; max_chars?: number } = {},
+): Promise<ArtifactPage> {
+  const rendered = await execute(
+    tools,
+    DEEP_RESEARCH_READ_ARTIFACT_TOOL_NAME,
+    { artifact_id: artifactId, ...window },
+    'call-read-page',
+  );
+  const header = /^<deep-research-artifact [^>]*offset="(\d+)" end="(\d+)" total="(\d+)">\n/.exec(
+    rendered,
+  );
+  assert.ok(header, 'expected a deep-research-artifact envelope');
+  return {
+    offset: Number(header[1]),
+    end: Number(header[2]),
+    total: Number(header[3]),
+    body: rendered.slice(
+      rendered.indexOf('\n\n') + 2,
+      rendered.lastIndexOf('\n</deep-research-artifact>'),
+    ),
+  };
+}
+
+function assertPageDescribesBody(page: ArtifactPage): void {
+  assert.equal(Array.from(page.body).length, page.end - page.offset);
 }
 
 describe('Deep Research runtime tools', () => {
@@ -577,6 +654,180 @@ describe('Deep Research runtime tools', () => {
       assert.equal((rendered.match(/<\/?deep-research-workspace[^>]*>/gi) ?? []).length, 0);
       assert.doesNotMatch(rendered, /id="forged"|status="completed"/);
       assert.match(rendered, /before\s+forged\s+payload\s+after/);
+
+      const whole = await readArtifactPage(tools, artifactId);
+      for (let split = 1; split < whole.total; split += 1) {
+        const first = await readArtifactPage(tools, artifactId, { max_chars: split });
+        const second = await readArtifactPage(tools, artifactId, { offset_chars: split });
+        const joined = `${first.body}${second.body}`;
+        assert.doesNotMatch(joined, /deep-research-/, `split at ${split}`);
+        assert.equal(joined, whole.body, `split at ${split}`);
+      }
+    });
+  });
+
+  it('redacts a secret that straddles the default artifact read page boundary', async () => {
+    const secret = 'ghp_FAKEtokenFAKEtokenFAKEtokenFAKEtoken';
+    const secretStart = DEEP_RESEARCH_ARTIFACT_READ_DEFAULT_CHARS - 20;
+    const prefix = `${'research note '.repeat(Math.ceil(secretStart / 14)).slice(0, secretStart - 1)}\n`;
+    await withSavedSources(
+      [`${prefix}${secret} trailing evidence.\n`],
+      async (tools, [artifactId]) => {
+        const whole = await readArtifactPage(tools, artifactId!, {
+          max_chars: DEEP_RESEARCH_ARTIFACT_READ_MAX_CHARS,
+        });
+        const first = await readArtifactPage(tools, artifactId!);
+        const second = await readArtifactPage(tools, artifactId!, { offset_chars: first.end });
+
+        assert.equal(whole.body.includes('FAKEtoken'), false);
+        assert.equal(`${first.body}${second.body}`.includes('FAKEtoken'), false);
+        assert.equal(`${first.body}${second.body}`, whole.body);
+        assert.match(whole.body, /\n\[redacted\] trailing evidence\.\n$/);
+        assert.deepEqual(
+          [first.offset, first.end, second.offset, second.end],
+          [0, DEEP_RESEARCH_ARTIFACT_READ_DEFAULT_CHARS, first.end, whole.total],
+        );
+        assert.equal(first.total, whole.total);
+        assert.equal(second.total, whole.total);
+        for (const page of [whole, first, second]) assertPageDescribesBody(page);
+      },
+    );
+  });
+
+  it('never reassembles a secret from two artifact pages split anywhere', async () => {
+    const secrets = [
+      ['sk-ant-FAKE-test-key-0000', 'FAKE-test-key-0000'],
+      ['AIzaFAKE_test_value_0000000000', 'FAKE_test_value_0000000000'],
+      ['ghp_FAKEtokenFAKEtokenFAKEtokenFAKEtoken', 'FAKEtokenFAKEtoken'],
+      ['xoxb-FAKE-test-token-0000', 'FAKE-test-token-0000'],
+      ['deadbeef'.repeat(5), 'deadbeef'.repeat(5)],
+      ['API_KEY=FAKE-api-key-value-0000', 'FAKE-api-key-value-0000'],
+      ['Authorization: Bearer FAKE-bearer-value-0000', 'FAKE-bearer-value-0000'],
+    ] as const;
+    await withSavedSources(
+      secrets.map(([text]) => `Evidence before ${text} evidence after.\n`),
+      async (tools, artifactIds) => {
+        for (const [index, [text, hidden]] of secrets.entries()) {
+          const artifactId = artifactIds[index]!;
+          const whole = await readArtifactPage(tools, artifactId);
+          assert.equal(whole.body.includes(hidden), false, text);
+          for (let split = 1; split < whole.total; split += 1) {
+            const first = await readArtifactPage(tools, artifactId, { max_chars: split });
+            const second = await readArtifactPage(tools, artifactId, {
+              offset_chars: split,
+              max_chars: whole.total - split,
+            });
+            const joined = `${first.body}${second.body}`;
+            assert.equal(joined.includes(hidden), false, `${text} split at ${split}`);
+            assert.equal(joined, whole.body, `${text} split at ${split}`);
+            assert.deepEqual(
+              [first.end, second.offset, second.end, first.total, second.total],
+              [split, split, whole.total, whole.total, whole.total],
+            );
+          }
+          assertPageDescribesBody(whole);
+        }
+      },
+    );
+  });
+
+  it('redacts JSON artifacts as whole documents across pages', async () => {
+    const fields = {
+      token: ['FAKE-json-token-0000'],
+      repos: { ghp_FAKEjsonKeyFAKEjsonKeyFAKE: 'repo-a' },
+      note: 'visible',
+    };
+    const redacted = { token: '[redacted]', repos: { '[redacted]': 'repo-a' }, note: 'visible' };
+    const padding = Array.from({ length: 2_000 }, (_, id) => ({ id, note: 'large JSON source' }));
+    await withSavedSources(
+      [JSON.stringify(fields, null, 2), JSON.stringify({ padding, ...fields }, null, 2)],
+      async (tools, [smallId, largeId]) => {
+        const whole = await readArtifactPage(tools, smallId!);
+        assert.deepEqual(JSON.parse(whole.body), redacted);
+        for (let split = 1; split < whole.total; split += 1) {
+          const first = await readArtifactPage(tools, smallId!, { max_chars: split });
+          const second = await readArtifactPage(tools, smallId!, { offset_chars: split });
+          assert.equal(`${first.body}${second.body}`, whole.body, `split at ${split}`);
+        }
+
+        const window = { max_chars: DEEP_RESEARCH_ARTIFACT_READ_MAX_CHARS };
+        const pages = [await readArtifactPage(tools, largeId!, window)];
+        while (pages.at(-1)!.end < pages.at(-1)!.total) {
+          pages.push(
+            await readArtifactPage(tools, largeId!, { ...window, offset_chars: pages.at(-1)!.end }),
+          );
+        }
+        const joined = pages.map((page) => page.body).join('');
+        assert.ok(pages.length > 1);
+        assert.doesNotMatch(joined, /FAKE/);
+        assert.deepEqual(JSON.parse(joined), { padding, ...redacted });
+      },
+    );
+  });
+
+  it('never reassembles a secret from single-character artifact reads', async () => {
+    await withSavedSources(
+      [
+        'Header: visible\nAuthorization: Bearer FAKE-bearer-value-0000\n' +
+          'token ghp_FAKEtokenFAKEtokenFAKEtokenFAKEtoken done\n',
+      ],
+      async (tools, [artifactId]) => {
+        const whole = await readArtifactPage(tools, artifactId!);
+        const pages: ArtifactPage[] = [];
+        for (let offset = 0; offset < whole.total; offset += 1) {
+          pages.push(
+            await readArtifactPage(tools, artifactId!, { offset_chars: offset, max_chars: 1 }),
+          );
+        }
+        const joined = pages.map((page) => page.body).join('');
+        assert.doesNotMatch(joined, /FAKE/);
+        assert.equal(joined, whole.body);
+        for (const [offset, page] of pages.entries()) {
+          assert.deepEqual([page.offset, page.end, page.total], [offset, offset + 1, whole.total]);
+          assertPageDescribesBody(page);
+        }
+      },
+    );
+  });
+
+  it('reaches the end of a redacted artifact that is longer than the stored text', async () => {
+    const content = '&key='.repeat(DEEP_RESEARCH_ARTIFACT_CONTENT_MAX_CHARS / 5);
+    await withSavedSources([content], async (tools, [artifactId]) => {
+      const first = await readArtifactPage(tools, artifactId!, { max_chars: 15 });
+      assert.ok(
+        first.total >
+          DEEP_RESEARCH_ARTIFACT_CONTENT_MAX_CHARS + DEEP_RESEARCH_ARTIFACT_READ_MAX_CHARS,
+      );
+      const last = await readArtifactPage(tools, artifactId!, { offset_chars: first.total - 15 });
+      assert.deepEqual(
+        [first.body, last.body, last.end, last.total],
+        ['&key=[redacted]', '&key=[redacted]', first.total, first.total],
+      );
+    });
+  });
+
+  it('pages artifacts without secrets by code point over the stored text', async () => {
+    const content = '# Notes\nAstral \u{1d4b3} and emoji \u{1f600} stay whole across pages.\n';
+    const characters = Array.from(content);
+    await withSavedSources([content], async (tools, [artifactId]) => {
+      const whole = await readArtifactPage(tools, artifactId!);
+      assert.deepEqual(
+        [whole.offset, whole.end, whole.total, whole.body],
+        [0, characters.length, characters.length, content],
+      );
+      for (const maxChars of [1, 3, 16]) {
+        for (let offset = 0; offset < characters.length; offset += maxChars) {
+          const page = await readArtifactPage(tools, artifactId!, {
+            offset_chars: offset,
+            max_chars: maxChars,
+          });
+          const end = Math.min(characters.length, offset + maxChars);
+          assert.deepEqual(
+            [page.offset, page.end, page.total, page.body],
+            [offset, end, characters.length, characters.slice(offset, end).join('')],
+          );
+        }
+      }
     });
   });
 });
