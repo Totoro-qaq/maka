@@ -389,8 +389,10 @@ test('a term with an unpaired surrogate bypasses the candidate source', async ()
   for (const [term, anchor] of [
     ['\uD800', 'm-lone'],
     ['c\uD800d', 'm-lone'],
-    // Half of the pair in the stored emoji: this double finds it, SQLite does not.
+    // Either half of the pair in the stored emoji: this double finds it, SQLite
+    // does not.
     ['\uD83D', 'm-emoji'],
+    ['\uDE80', 'm-emoji'],
   ] as const) {
     const result = await runRecall({ terms: [term] }, candidateDeps(data));
     assert.ok(result.ok);
@@ -399,7 +401,11 @@ test('a term with an unpaired surrogate bypasses the candidate source', async ()
       true,
       `${JSON.stringify(term)} must not use the candidate source`,
     );
-    assert.deepEqual(anchorIds(result.passages), [anchor]);
+    assert.deepEqual(
+      anchorIds(result.passages),
+      [anchor],
+      `${JSON.stringify(term)} must return its passage`,
+    );
   }
 
   // A surrogate pair is one character, stored literally, so the candidate
