@@ -321,6 +321,22 @@ describe('CommandCodeBrowserLoginController', () => {
     controller.cancel('unknown');
   });
 
+  test('cancelling an attempt nobody is collecting drops it', async () => {
+    // The renderer's stale-start path: an ok start that is only ever cancelled.
+    const controller = makeController();
+    const started = await startOk(controller);
+    controller.cancel(started.attemptId);
+    assert.equal(controller.attemptCount(), 0);
+    assert.deepEqual(await controller.complete(started.attemptId), {
+      ok: false,
+      reason: 'superseded',
+    });
+
+    await startOk(controller);
+    controller.cancel();
+    assert.equal(controller.attemptCount(), 0);
+  });
+
   test('a new start supersedes the live attempt and rebinds the same port', async () => {
     const controller = makeController();
     const first = await startOk(controller);
@@ -353,6 +369,7 @@ describe('CommandCodeBrowserLoginController', () => {
       if (await isPortFree(port)) free.push(port);
     }
     assert.equal(free.length, 1, `exactly one port stays bound, free: ${free.join(',')}`);
+    assert.equal(controller.attemptCount(), 1, 'the loser is not held for a complete()');
 
     const callback = new URL(new URL(winner.authUrl).searchParams.get('callback') ?? '');
     const completion = controller.complete(winner.attemptId);
@@ -373,6 +390,7 @@ describe('CommandCodeBrowserLoginController', () => {
     const controller = makeController({ maxPortAttempts: 1 }, opened);
     assert.deepEqual(await controller.start(), { ok: false, reason: 'port_unavailable' });
     assert.deepEqual(opened, []);
+    assert.equal(controller.attemptCount(), 0, 'a failed start hands out no id to complete()');
   });
 
   test('a browser that cannot open fails the start and releases the port', async () => {
@@ -382,6 +400,7 @@ describe('CommandCodeBrowserLoginController', () => {
       },
     });
     assert.deepEqual(await controller.start(), { ok: false, reason: 'browser_unavailable' });
+    assert.equal(controller.attemptCount(), 0, 'a failed start hands out no id to complete()');
     // The port is free again for a controller that can open a browser.
     const next = makeController();
     const started = await startOk(next);
@@ -401,5 +420,14 @@ describe('CommandCodeBrowserLoginController', () => {
     controller.dispose();
     assert.deepEqual(await completion, { ok: false, reason: 'cancelled' });
     assert.equal((await controller.start()).ok, false);
+  });
+
+  test('dispose drops attempts nobody collected', async () => {
+    const controller = makeController();
+    // Superseded by the next start, and never collected.
+    await startOk(controller);
+    await startOk(controller);
+    controller.dispose();
+    assert.equal(controller.attemptCount(), 0);
   });
 });

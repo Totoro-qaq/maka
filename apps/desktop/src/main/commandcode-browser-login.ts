@@ -178,14 +178,14 @@ export class CommandCodeBrowserLoginController {
 
     const bound = await this.#bind(attempt);
     if (!bound) {
-      this.#finish(attempt, { ok: false, reason: 'port_unavailable' });
+      this.#abandon(attempt, { ok: false, reason: 'port_unavailable' });
       return { ok: false, reason: 'port_unavailable' };
     }
     // A newer start (or a cancel, or dispose) retired this attempt while it
     // was binding. Its result has already settled; the port it just took is
     // held by nobody, so release it here.
     if (attempt.settle === undefined || this.#disposed) {
-      this.#finish(attempt, { ok: false, reason: 'superseded' });
+      this.#abandon(attempt, { ok: false, reason: 'superseded' });
       return { ok: false, reason: 'superseded' };
     }
 
@@ -203,7 +203,7 @@ export class CommandCodeBrowserLoginController {
     try {
       await this.#deps.openExternal(authUrl);
     } catch {
-      this.#finish(attempt, { ok: false, reason: 'browser_unavailable' });
+      this.#abandon(attempt, { ok: false, reason: 'browser_unavailable' });
       return { ok: false, reason: 'browser_unavailable' };
     }
     // The browser may already have posted back while openExternal was
@@ -227,13 +227,21 @@ export class CommandCodeBrowserLoginController {
   cancel(attemptId?: string): void {
     const attempt = attemptId === undefined ? this.#current : this.#attempts.get(attemptId);
     if (attempt === undefined) return;
-    this.#finish(attempt, { ok: false, reason: 'cancelled' });
+    this.#abandon(attempt, { ok: false, reason: 'cancelled' });
   }
 
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
     this.#finish(this.#current, { ok: false, reason: 'cancelled' });
+    // Every other attempt settled when it was retired, and a waiting
+    // `complete()` holds its own.
+    this.#attempts.clear();
+  }
+
+  /** Attempts held for a `complete()` — asserts the leak invariant in tests. */
+  attemptCount(): number {
+    return this.#attempts.size;
   }
 
   // ---------------------------------------------------------------------
@@ -383,6 +391,16 @@ export class CommandCodeBrowserLoginController {
     const settle = attempt.settle;
     attempt.settle = undefined;
     settle?.(result);
+  }
+
+  /**
+   * Finishes an attempt nobody will look up again: a failed start never
+   * handed its id out, and a cancel walks away from its own. A `complete()`
+   * already waiting holds the attempt itself and still reads the result.
+   */
+  #abandon(attempt: Attempt, result: CommandCodeBrowserLoginResult): void {
+    this.#finish(attempt, result);
+    this.#attempts.delete(attempt.id);
   }
 }
 
