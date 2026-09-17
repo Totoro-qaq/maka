@@ -20,8 +20,13 @@
 import { stat } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 
-/** More paths than one drop or paste could carry is not a request from the composer. */
-export const DIRECTORY_DETECTION_MAX_PATHS = 64;
+/**
+ * Paths past this many in one request are answered false without a stat. The
+ * bound only caps the filesystem work one request can cause: a drop this large
+ * can never be sent (MAX_ATTACHMENT_COUNT), and the send path still names an
+ * unreadable item it lets through.
+ */
+export const DIRECTORY_DETECTION_MAX_PATHS = 1024;
 
 /**
  * Answers, for each path the preload read from a dropped or pasted File,
@@ -34,12 +39,18 @@ export async function detectAttachmentDirectories(
   paths: unknown,
   statPath: (path: string) => Promise<{ isDirectory(): boolean }> = stat,
 ): Promise<boolean[]> {
-  if (!Array.isArray(paths) || paths.length > DIRECTORY_DETECTION_MAX_PATHS) {
+  if (!Array.isArray(paths)) {
     throw new Error('Invalid attachment directory detection request');
   }
   return await Promise.all(
-    paths.map(async (path) => {
-      if (typeof path !== 'string' || !isAbsolute(path)) return false;
+    paths.map(async (path, index) => {
+      if (
+        index >= DIRECTORY_DETECTION_MAX_PATHS ||
+        typeof path !== 'string' ||
+        !isAbsolute(path)
+      ) {
+        return false;
+      }
       try {
         return (await statPath(path)).isDirectory();
       } catch {

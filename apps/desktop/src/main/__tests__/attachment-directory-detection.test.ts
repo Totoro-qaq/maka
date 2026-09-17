@@ -49,13 +49,41 @@ describe('attachment directory detection (#5279)', () => {
     }
   });
 
-  it('refuses a request that is not a bounded list of paths', async () => {
-    await assert.rejects(detectAttachmentDirectories('not-a-list'));
+  it('refuses a request that is not a list of paths', async () => {
     await assert.rejects(
-      detectAttachmentDirectories(
-        Array.from({ length: DIRECTORY_DETECTION_MAX_PATHS + 1 }, () => tmpdir()),
-      ),
+      detectAttachmentDirectories('not-a-list'),
+      /Invalid attachment directory detection request/,
     );
+  });
+
+  it('still finds a folder dropped with hundreds of files', async () => {
+    const folder = join(tmpdir(), 'Project');
+    const dropped = [
+      ...Array.from({ length: 255 }, (_, index) => join(tmpdir(), `file-${index}.txt`)),
+      folder,
+    ];
+    const result = await detectAttachmentDirectories(dropped, async (path) => ({
+      isDirectory: () => path === folder,
+    }));
+    assert.equal(result.length, dropped.length);
+    assert.equal(result.at(-1), true);
+  });
+
+  it('answers false without a stat past the bound, and still classifies the paths before it', async () => {
+    let stats = 0;
+    const result = await detectAttachmentDirectories(
+      Array.from({ length: DIRECTORY_DETECTION_MAX_PATHS + 2 }, () => tmpdir()),
+      async () => {
+        stats += 1;
+        return { isDirectory: () => true };
+      },
+    );
+    assert.equal(stats, DIRECTORY_DETECTION_MAX_PATHS);
+    assert.deepEqual(result, [
+      ...Array.from({ length: DIRECTORY_DETECTION_MAX_PATHS }, () => true),
+      false,
+      false,
+    ]);
   });
 
   it('answers on the channel the preload invokes', async () => {

@@ -254,6 +254,11 @@ function transcriptRecordsTerminalTurn(
   return false;
 }
 
+/** The main composer's copy for an attachment the send path refused. */
+function attachmentBlockedMessage(code: AttachmentIngestBlockedCode, locale: UiLocale): string {
+  return getShellCopy(locale).sessionSettingsActions.attachmentIngestBlocked[code];
+}
+
 /**
  * Companion for the quote side panel. On the first question it FORKS the main
  * session (`branchFromTurn` from the latest SETTLED turn) into a child that
@@ -270,11 +275,6 @@ function transcriptRecordsTerminalTurn(
  * from the owning source session), which removes the ephemeral fork. Workbar
  * collapse and New Tab navigation keep the panel mounted.
  */
-/** The main composer's copy for an attachment the send path refused. */
-function attachmentBlockedMessage(code: AttachmentIngestBlockedCode, locale: UiLocale): string {
-  return getShellCopy(locale).sessionSettingsActions.attachmentIngestBlocked[code];
-}
-
 export function useQuoteCompanion(input: UseQuoteCompanionInput): UseQuoteCompanionResult {
   const { sideChat } = useWorkbarServices();
   const {
