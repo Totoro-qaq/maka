@@ -150,7 +150,8 @@ function redactJsonValue(value: unknown): { value: unknown; changed: boolean } {
   const next: Record<string, unknown> = {};
   for (const [key, raw] of Object.entries(value)) {
     // A key can hold a credential too (a token used as a map key, a header
-    // line). Keys that redact to the same text collapse into one entry.
+    // line). Keys that redact to the same text collapse into one entry, which
+    // keeps only the last of their values.
     const nextKey = redactTextSecrets(key);
     changed = changed || nextKey !== key;
     if (isSensitiveKey(key)) {
