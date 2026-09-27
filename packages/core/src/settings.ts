@@ -463,7 +463,11 @@ export function normalizeTerminalFontSize(value: unknown): number {
   );
 }
 
+export type WorkbarTogglePosition = 'titlebar' | 'edge';
+
 export interface AppearanceSettings {
+  /** Where the desktop exposes the Workbar expand/collapse control. */
+  workbarTogglePosition?: WorkbarTogglePosition;
   theme: ThemePreference;
   /** Optional palette override; missing values normalize to `default`. */
   palette?: ThemePalette;
@@ -542,15 +546,13 @@ export interface ChatDefaultsSettings {
 }
 
 /**
- * Desktop OS notifications (Settings → 通用 → 通知). The runtime only
- * knows a turn ended from the renderer; the main process owns the focus
- * gate + native `Notification`, so this is a pure product on/off toggle.
+ * Client-local preference for desktop notifications.
  */
 export interface NotificationSettings {
   /**
-   * When enabled, the desktop app raises a native notification once an
-   * agent turn finishes (completed or errored) **while its window is not
-   * focused**. Focus + OS-permission gating live in the main process.
+   * When enabled, the desktop app raises a native notification and bounces
+   * the dock once an agent turn finishes (completed or errored) or waits on the user
+   * **while its window is not focused**. Delivery still depends on OS permissions.
    */
   runComplete: boolean;
 }
@@ -587,6 +589,8 @@ export interface ShellSettings {
 }
 
 export interface AppSettings {
+  /** Host-owned projection. apiKey is masked; writes go to the Host credential vault. */
+  jev: { enabled: boolean; apiKey: string };
   schemaVersion: 1;
   network: AppNetworkSettings;
   botChat: BotChatSettings;
@@ -778,6 +782,7 @@ export type SettingsTestResultCode =
   | 'bot_connection_failed';
 
 export type UpdateAppSettingsInput = Partial<{
+  jev: Partial<AppSettings['jev']>;
   network: Partial<{
     proxy: NetworkProxySettingsPatch;
   }>;
@@ -851,6 +856,7 @@ export function createDefaultSettings(): AppSettings {
       activeTab: 'requests',
     },
     appearance: {
+      workbarTogglePosition: 'edge',
       theme: 'auto',
       palette: 'default',
       appIcon: DEFAULT_APP_ICON,
@@ -873,6 +879,7 @@ export function createDefaultSettings(): AppSettings {
     },
     privacy: defaultPrivacySettings(),
     projects: defaultProjectPreferencesSettings(),
+    jev: { enabled: false, apiKey: '' },
     chatDefaults: defaultChatDefaultsSettings(),
     notifications: {
       runComplete: true,
@@ -1043,6 +1050,8 @@ export function normalizeSettings(input: unknown): AppSettings {
     // position; UI density is no longer a product setting.
     appearance: {
       ...appearanceWithoutLegacyFields,
+      workbarTogglePosition:
+        base.appearance.workbarTogglePosition === 'titlebar' ? 'titlebar' : 'edge',
       palette: isThemePalette(base.appearance.palette) ? base.appearance.palette : 'default',
       // Same fail-closed rule as `palette` above, for the same reason: an
       // unknown id would otherwise reach the main process and resolve to a

@@ -277,6 +277,7 @@ describe('Session catalog protocol', () => {
           sessionId: 'session-executor',
           workspace: { kind: 'project', projectId: 'project-1' },
           executorId: 'codex.app-server',
+          executorConfig: { model: 'account-model' },
         },
       }),
       {
@@ -286,6 +287,7 @@ describe('Session catalog protocol', () => {
           sessionId: 'session-executor',
           workspace: { kind: 'project', projectId: 'project-1' },
           executorId: 'codex.app-server',
+          executorConfig: { model: 'account-model' },
         },
       },
     );
@@ -712,3 +714,65 @@ function isProtocolError(error: unknown): boolean {
 function isInvalidSessionStatus(error: unknown): boolean {
   return error instanceof RuntimeHostProtocolError && error.message === 'Invalid Session status';
 }
+
+test('executor configuration rejects ambiguous routes and malformed values', () => {
+  const base = {
+    sessionId: 'session-executor',
+    workspace: { kind: 'project', projectId: 'project-1' },
+  };
+  for (const executorConfig of [
+    null,
+    { model: '' },
+    { model: 'bad\nvalue' },
+    { mode: 'yolo' },
+    { model: 4 },
+  ]) {
+    assert.throws(
+      () =>
+        decodeClientFrame({
+          requestId: 'r',
+          operation: 'session.create',
+          input: { ...base, executorId: 'remote', executorConfig },
+        }),
+      isProtocolError,
+    );
+  }
+  assert.throws(
+    () =>
+      decodeClientFrame({
+        requestId: 'r',
+        operation: 'session.create',
+        input: { ...base, modelTarget: { kind: 'default' }, executorConfig: { model: 'other' } },
+      }),
+    isProtocolError,
+  );
+  assert.throws(
+    () => decodeSessionCatalogItem({ ...projection(), executorConfig: { model: 'other' } }),
+    isProtocolError,
+  );
+});
+
+test('decodes a Session attention payload on a catalog change', () => {
+  assert.deepEqual(
+    decodeHostFrame({
+      kind: 'session.catalog.changed',
+      revision: 4,
+      sessionId: 'session-1',
+      attention: {
+        kind: 'errored',
+        eventId: 'terminal-1',
+        body: 'Provider request failed',
+      },
+    }),
+    {
+      kind: 'session.catalog.changed',
+      revision: 4,
+      sessionId: 'session-1',
+      attention: {
+        kind: 'errored',
+        eventId: 'terminal-1',
+        body: 'Provider request failed',
+      },
+    },
+  );
+});

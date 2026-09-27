@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import { AttachmentIngestBlockedError } from '@maka/core/attachments';
 import { getShellCopy } from '../../renderer/locales/shell-copy.js';
-import { getDesktopConversationCopy } from '../../renderer/locales/conversation-copy.js';
+import { getDesktopConversationCopy } from '../../renderer/application/contracts/conversation-copy.js';
 import { parseHTML } from 'linkedom';
 import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';

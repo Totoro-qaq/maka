@@ -35,7 +35,7 @@ import type { WorkBoardItem, WorkBoardLinkedSession } from '@maka/core/work-boar
 import { useUiLocale, type ComposerHandle, type ToastApi } from '@maka/ui';
 import type { ChatModelChoice } from '@maka/ui';
 import { safeLocalStorageGet, safeLocalStorageSet } from '../../../browser-storage.js';
-import { getDesktopConversationCopy } from '../../../locales/conversation-copy.js';
+import { getDesktopConversationCopy } from '../../../application/contracts/conversation-copy.js';
 import { getShellCopy, localizedShellErrorMessage } from '../../../locales/shell-copy.js';
 import { sideChatTitleFromPrompt } from '../../../side-chat-command.js';
 import { desktopSessionKey, parseDesktopSessionKey } from '../../../../shared/runtime-host-identity.js';
@@ -117,7 +117,7 @@ export interface UseWorkbarControllerInput {
   toastApi: ToastApi;
   composerRef?: { current: Pick<ComposerHandle, 'focus' | 'setDraft'> | null };
   openNewTaskSurface?(): number;
-  openSessionInChat?(sessionId: string): void;
+  openSessionInChat?(sessionId: string, turnId?: string): void;
   resolveWorkBoardTarget?(item: WorkBoardItem):
     | { ok: true; target: { profileId: string; hostId: string; projectId: string } }
     | { ok: false; message: string };
@@ -982,6 +982,7 @@ export function useWorkbarController(
       },
       onActivityStateChange: sideConversations.setActive,
       sourceSession: input.activeSession,
+      onOpenConversation: input.openSessionInChat,
       modelChoices: input.modelChoices,
       onStartWorkBoardTask: startWorkBoardTask,
       resolveWorkBoardStartTask: input.resolveWorkBoardTarget,
