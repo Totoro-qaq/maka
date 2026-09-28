@@ -307,8 +307,8 @@ describe('redactSecrets', () => {
     }
   });
 
-  test('scans long harmless assignment values in bounded time', () => {
-    const started = Date.now();
+  test('scans long harmless assignment values within a bounded CPU budget', () => {
+    const started = process.cpuUsage();
     for (const text of [
       `note: ${'a:'.repeat(100_000)}`,
       `data=${'a-'.repeat(100_000)}`,
@@ -317,11 +317,13 @@ describe('redactSecrets', () => {
     ]) {
       assert.equal(redactSecrets(text), text);
     }
-    const elapsed = Date.now() - started;
+    const { user, system } = process.cpuUsage(started);
+    const cpuMs = (user + system) / 1_000;
     // Rescanning the rest of the value per nested key or per hyphen, retrying a
     // key at every hyphen of a bare run, or splitting a long uppercase key with
-    // backtracking takes seconds to tens of seconds.
-    assert.ok(elapsed < 5_000, `scanned in ${elapsed}ms, which must not rescan the value`);
+    // backtracking takes seconds to tens of seconds. Count this process's CPU
+    // time so being descheduled on a busy CI runner does not spend the budget.
+    assert.ok(cpuMs < 5_000, `scanned in ${cpuMs}ms CPU, which must not rescan the value`);
   });
 
   test('preserves own __proto__ data properties while redacting serialized JSON', () => {
