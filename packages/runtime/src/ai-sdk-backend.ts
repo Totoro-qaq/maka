@@ -124,6 +124,8 @@ export interface AiSdkBackendInput extends AiSdkCompactionCapabilities {
   providerStateIdentity?: `sha256:${string}`;
   /** Reads the authoritative session boundary immediately before every local tool invocation. */
   readExecutionBoundary: ToolRuntimeInput['readExecutionBoundary'];
+  /** Reads the user's current Session permission selection for each local tool invocation. */
+  readPermissionMode: ToolRuntimeInput['readPermissionMode'];
   createSandboxBoundaryRequest?: ToolRuntimeInput['createSandboxBoundaryRequest'];
   settleSandboxBoundaryRequest?: ToolRuntimeInput['settleSandboxBoundaryRequest'];
 
@@ -242,6 +244,8 @@ export interface AiSdkBackendInput extends AiSdkCompactionCapabilities {
 
 export interface ResolvedSystemPrompt {
   text?: string;
+  /** Per-step ephemeral user-role context, resolved once per logical request. */
+  contexts?: readonly { readonly name: string; readonly text: string }[];
   sourceRevisions: readonly RunCompositionSourceRevision[];
 }
 
@@ -249,6 +253,8 @@ export interface SystemPromptContext {
   sessionId: string;
   turnId: string;
   cwd: string;
+  /** Sampled once for this execution; absent during prompt inspection without a live turn. */
+  turnStartedAt?: number;
   /** Diagnostic-only skill catalog trace; never affects prompt construction. */
   emitSkillCatalogTrace?: (message: string, data?: Record<string, unknown>) => void;
 }
@@ -316,17 +322,7 @@ export class AiSdkBackend implements AgentBackend {
    */
   private readonly activeTurns = new Set<AiSdkTurn>();
   private readonly compaction: AiSdkCompaction;
-  /**
-   * The provider has been reported dropping context, for this backend.
-   *
-   * Not per send: the condition persists once a provider starts truncating, so
-   * a note on every later turn would repeat one fact the user has already been
-   * told. The scope is this backend's lifetime rather than the Session's, so a
-   * backend that is disposed and rebuilt may say it once more.
-   */
-  private readonly turnSessionState: AiSdkSessionState = {
-    contextProviderDroppingReported: false,
-  };
+  private readonly turnSessionState: AiSdkSessionState = {};
   constructor(input: AiSdkBackendInput) {
     this.input = input;
     this.sessionId = input.sessionId;
@@ -391,7 +387,6 @@ export class AiSdkBackend implements AgentBackend {
       targetConnectionId: input.header.llmConnectionId,
       targetProviderStateIdentity: input.providerStateIdentity,
       now: this.now,
-      modelAdapter: this.modelAdapter,
       createProviderRequestTracker: (trackerInput) =>
         this.providerTelemetry.createTracker(trackerInput),
       materializeRuntimeReplayPlan: (
@@ -497,6 +492,7 @@ export class AiSdkBackend implements AgentBackend {
       connection: input.connection,
       modelId: input.modelId,
       readExecutionBoundary: input.readExecutionBoundary,
+      readPermissionMode: input.readPermissionMode,
       createSandboxBoundaryRequest: input.createSandboxBoundaryRequest,
       settleSandboxBoundaryRequest: input.settleSandboxBoundaryRequest,
       newId: this.newId,

@@ -154,6 +154,7 @@ interface GraphDriver {
   driveGeneration: number;
   activeDriveGeneration?: number;
   closed: boolean;
+  reconciliationReaders: number;
   abortController?: AbortController;
   task?: Promise<void>;
   stopTask?: Promise<void>;
@@ -526,16 +527,25 @@ export class AgentGraphCoordinator {
   /** Reconcile now and surface any host-level failure to explicit callers. */
   async reconcile(rootSessionId: string): Promise<AgentGraphScheduleReconciliationResult> {
     await this.#assertRootSupervisor(rootSessionId);
-    const driver = await this.#driver(rootSessionId);
-    driver.lastError = undefined;
-    driver.paused = false;
-    this.#requestDrive(driver);
-    await this.waitForIdle(rootSessionId);
-    if (driver.lastError !== undefined) throw driver.lastError;
-    if (!driver.lastResult) {
-      throw new Error(`Agent graph ${driver.graphId} produced no reconciliation result`);
+    let driver = await this.#driver(rootSessionId);
+    // A lookup started before handover can return after its driver retired.
+    while (driver.closed && !this.#closed) driver = await this.#driver(rootSessionId);
+    driver.reconciliationReaders += 1;
+    try {
+      driver.lastError = undefined;
+      driver.paused = false;
+      this.#requestDrive(driver);
+      // An epoch handover must not redirect this caller to the next driver.
+      while (driver.task) await driver.task;
+      if (driver.lastError !== undefined) throw driver.lastError;
+      if (!driver.lastResult) {
+        throw new Error(`Agent graph ${driver.graphId} produced no reconciliation result`);
+      }
+      return driver.lastResult;
+    } finally {
+      driver.reconciliationReaders -= 1;
+      if (driver.closed && driver.reconciliationReaders === 0) driver.lastResult = undefined;
     }
-    return driver.lastResult;
   }
 
   async waitForIdle(rootSessionId: string): Promise<void> {
@@ -551,13 +561,36 @@ export class AgentGraphCoordinator {
    */
   async recover(): Promise<string[]> {
     const recovered: string[] = [];
+    const listedRecoveryGraphIds = this.#input.controlStore.listAgentGraphScheduleRecoveryGraphIds
+      ? await this.#input.controlStore.listAgentGraphScheduleRecoveryGraphIds()
+      : undefined;
+    const recoveryGraphIds = listedRecoveryGraphIds ? new Set(listedRecoveryGraphIds) : undefined;
+    if (recoveryGraphIds?.size === 0) return recovered;
+    const recoveryRootSessionIds = new Set<string>();
+    if (recoveryGraphIds && this.#input.epochStore) {
+      for (const graphId of recoveryGraphIds) {
+        const binding = await this.#input.epochStore.readAgentGraphEpochByGraphId(graphId);
+        if (binding) recoveryRootSessionIds.add(binding.rootSessionId);
+      }
+    }
     for (const header of await this.#input.sessionStore.listForRecovery()) {
       if (this.#input.rootSessionId && header.id !== this.#input.rootSessionId) continue;
       if (header.subagentParent || header.isArchived) continue;
+      if (
+        recoveryGraphIds &&
+        !recoveryGraphIds.has(agentGraphIdForRootSession(header.id)) &&
+        !recoveryRootSessionIds.has(header.id)
+      ) {
+        continue;
+      }
       const graphId = await this.currentGraphId(header.id);
-      const updates = await this.#input.controlStore.listAgentGraphScheduleUpdates(graphId);
-      if (updates.length === 0) continue;
-      updates.forEach((update) => this.#assertScheduleOwnedByRoot(update, header.id, graphId));
+      if (recoveryGraphIds) {
+        if (!recoveryGraphIds.has(graphId)) continue;
+      } else {
+        const updates = await this.#input.controlStore.listAgentGraphScheduleUpdates(graphId);
+        if (updates.length === 0) continue;
+        updates.forEach((update) => this.#assertScheduleOwnedByRoot(update, header.id, graphId));
+      }
       await this.reconcile(header.id);
       recovered.push(header.id);
     }
@@ -1424,14 +1457,29 @@ export class AgentGraphCoordinator {
       const latest = await this.currentGraphEpoch(rootSessionId);
       if (latest.graphId !== current.graphId) {
         selected = latest;
+        if (driver) void this.#retireDriver(driver);
         return;
       }
       if ((await this.#readSessionStateForGraph(rootSessionId, current.graphId)) !== 'terminal') {
         return;
       }
       selected = await this.advanceGraphEpoch(rootSessionId, current);
+      if (driver) void this.#retireDriver(driver);
     });
     return selected;
+  }
+
+  async #retireDriver(driver: GraphDriver): Promise<void> {
+    // Tool closures can outlive their epoch. Fence them and let already
+    // admitted operations finish before releasing their complete snapshots.
+    // Cleanup belongs to the old epoch; its teardown I/O must not block the next.
+    driver.closed = true;
+    driver.requested = false;
+    await Promise.allSettled([driver.task, driver.stopTask]);
+    await this.#waitForClientProjectionUpdates(driver);
+    if (driver.reconciliationReaders === 0) driver.lastResult = undefined;
+    driver.runtimeFailureRunIds.clear();
+    // Keep the lightweight driver for projection repair and close diagnostics.
   }
 
   async #readSessionStateForGraph(
@@ -1532,6 +1580,7 @@ export class AgentGraphCoordinator {
       stopGeneration: 0,
       driveGeneration: 0,
       closed: false,
+      reconciliationReaders: 0,
       clientProjectionDirty: false,
       runtimeFailureRunIds: new Set(),
       yieldWaiters: new Set(),
@@ -1566,6 +1615,7 @@ export class AgentGraphCoordinator {
   }
 
   #requestDrive(driver: GraphDriver): void {
+    if (driver.closed || this.#closed) return;
     driver.requested = true;
     if (driver.task) return;
     const residency = this.#input.acquireResidency?.(driver.rootSessionId);

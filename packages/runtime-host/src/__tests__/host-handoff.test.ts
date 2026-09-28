@@ -26,11 +26,14 @@ import {
   runHostHandoff,
   type HostHandoffAction,
   type HostHandoffBlocker,
+  type HostHandoffAttentionView,
+  type HostHandoffProgressView,
   type HostHandoffView,
   type OpenHostHandoffSurface,
 } from '../client/host-handoff.js';
 import { decodeClientFrame, decodeHostFrame } from '../protocol/index.js';
 import { decodeHostActivitySnapshot, isHostActivityIdle } from '../protocol/host-status.js';
+import { formatHostHandoff } from '../client/host-handoff-copy.js';
 
 const idle = { connections: 0, activeOperations: 0, processUptimeSeconds: 1, residencies: [] };
 const target = {
@@ -80,9 +83,24 @@ function surfaceHarness() {
     choose(view: HostHandoffView, action: HostHandoffAction) {
       submit(view.revision, action);
     },
-    view(predicate: (view: HostHandoffView) => boolean = () => true): Promise<HostHandoffView> {
-      if (latest && predicate(latest)) return Promise.resolve(latest);
-      return new Promise((resolve) => waiters.add({ predicate, resolve }));
+    view<V extends HostHandoffView = HostHandoffView>(
+      predicate:
+        | ((view: HostHandoffView) => view is V)
+        | ((view: HostHandoffView) => boolean) = () => true,
+    ): Promise<V> {
+      if (latest && predicate(latest)) return Promise.resolve(latest as V);
+      return new Promise((resolve) =>
+        waiters.add({
+          predicate: predicate as (view: HostHandoffView) => boolean,
+          resolve: resolve as (view: HostHandoffView) => void,
+        }),
+      );
+    },
+    attention(): Promise<HostHandoffAttentionView> {
+      return this.view((view): view is HostHandoffAttentionView => view.state === 'attention');
+    },
+    progress(): Promise<HostHandoffProgressView> {
+      return this.view((view): view is HostHandoffProgressView => view.state === 'progress');
     },
   };
 }
@@ -92,6 +110,54 @@ test('compatible connection needs no handoff surface', async () => {
     (await runHostHandoff({ observe: async () => ({ kind: 'ready', value: resource(42) }) })).value,
     42,
   );
+});
+
+test('handoff copy exposes background work even with zero operations and keeps legacy counts unknown', () => {
+  const view: HostHandoffView = {
+    revision: 'test',
+    target,
+    state: 'attention',
+    reason: 'busy',
+    mayExitNaturally: false,
+    actions: ['cancel', 'interrupt'],
+    defaultAction: 'cancel',
+    activity: {
+      ...idle,
+      residencies: [{ label: 'memory-extraction', count: 2 }],
+      drainResidencies: 2,
+    },
+  };
+  for (const [locale, known, unknown] of [
+    ['en', '2 background activities', 'Background activity count unknown'],
+    ['zh-CN', '2 个后台工作', '后台工作数量未知'],
+    ['zh-TW', '2 個背景工作', '背景工作數量未知'],
+  ] as const) {
+    assert.ok(formatHostHandoff(view, locale).detail.includes(known));
+    assert.ok(formatHostHandoff({ ...view, activity: idle }, locale).detail.includes(unknown));
+  }
+});
+
+test('managed handoff copy gives the user an executable Desktop recovery path', () => {
+  const view: HostHandoffView = {
+    revision: 'managed',
+    target,
+    state: 'attention',
+    reason: 'operator_required',
+    mayExitNaturally: false,
+    actions: ['cancel', 'retry'],
+    defaultAction: 'cancel',
+    recoveryBlocker: 'managed',
+  };
+  for (const [locale, expected] of [
+    [
+      'en',
+      'Desktop installed it, open this workspace there and choose Stop old service and continue',
+    ],
+    ['zh-CN', '在该 Desktop 中打开此工作区，然后选择“停止旧服务并继续”'],
+    ['zh-TW', '在該 Desktop 中開啟此工作區，然後選擇「停止舊服務並繼續」'],
+  ] as const) {
+    assert.match(formatHostHandoff(view, locale).description, new RegExp(expected, 'u'));
+  }
 });
 
 test('maintenance evidence distinguishes idle retention without guessing for legacy activity', () => {
@@ -225,7 +291,7 @@ test('progress Cancel aborts cooperative convergence but awaits safe transaction
   const rejection = assert.rejects(running, HostHandoffCancelledError).then(() => {
     finished = true;
   });
-  const view = await ui.view((candidate) => candidate.state === 'progress');
+  const view = await ui.progress();
   assert.equal(view.phase, 'pausing');
   assert.deepEqual(view.actions, ['cancel']);
   ui.choose(view, 'cancel');
@@ -260,7 +326,7 @@ test('unknown work requires explicit non-default consent', async () => {
             },
           }),
   });
-  const view = await ui.view();
+  const view = await ui.attention();
   assert.equal(view.reason, 'activity_unknown');
   assert.equal(view.defaultAction, 'cancel');
   ui.choose(view, 'interrupt');
@@ -365,7 +431,7 @@ test('a live blocking surface resolves automatically when work finishes', async 
             },
           }),
   });
-  assert.equal((await ui.view()).reason, 'busy');
+  assert.equal((await ui.attention()).reason, 'busy');
   active = false;
   assert.equal((await running).value, 'done');
   assert.equal(ui.closed, true);
@@ -396,7 +462,7 @@ test('automatic replacement attempts are bounded even if every successor conflic
   assert.equal(epoch, 3);
 });
 
-test('an admission refusal does not repeatedly retry the same idle observation', async () => {
+test('an idle Host that refuses safe retirement asks for interruption instead of a futile retry', async () => {
   let replacements = 0;
   await assert.rejects(
     runHostHandoff({
@@ -415,7 +481,13 @@ test('an admission refusal does not repeatedly retry the same idle observation',
           },
         }),
     }),
-    HostHandoffRequiredError,
+    (error: unknown) => {
+      assert.ok(error instanceof HostHandoffRequiredError);
+      assert.equal(error.view.reason, 'busy');
+      assert.deepEqual(error.view.actions, ['cancel', 'retry', 'interrupt']);
+      assert.match(formatHostHandoff(error.view, 'en').description, /refused safe retirement/u);
+      return true;
+    },
   );
   assert.equal(replacements, 1);
 });
@@ -460,6 +532,8 @@ test('transaction failure remains a repair outcome instead of an automatic retry
       assert.ok(error instanceof HostHandoffRequiredError);
       assert.equal(error.view.reason, 'repair_required');
       assert.equal(error.view.diagnostic, 'Writer release was not verified');
+      assert.match(formatHostHandoff(error.view, 'zh-CN').description, /修复原因后再重试/u);
+      assert.match(formatHostHandoff(error.view, 'en').description, /without a state change/u);
       return true;
     },
   );
@@ -501,4 +575,57 @@ test('cancellation does not abandon an in-flight deployment transaction', async 
   markFinished();
   await assert.rejects(running, /cancelled/);
   assert.equal(settled, true);
+});
+
+test('managed handoff rechecks without mutation and requests interruption only after safe admission refuses', async () => {
+  const ui = surfaceHarness();
+  const policies: string[] = [];
+  let observations = 0;
+  let ready = false;
+  const running = runHostHandoff({
+    openSurface: ui.openSurface,
+    pollIntervalMs: 1,
+    observe: async () => {
+      observations += 1;
+      if (ready) return { kind: 'ready', value: resource('connected') };
+      return blocked({
+        ...base,
+        manualRecheck: true,
+        activity: idle,
+        packageChange: { current: '0.2.0', target: '0.3.0' },
+        replacement: {
+          kind: 'replace',
+          canReplaceIdle: true,
+          canInterrupt: true,
+          requiresExplicitSelection: true,
+          execute: async (policy, _progress, consent) => {
+            assert.equal(consent, 'explicit');
+            policies.push(policy);
+            if (policy === 'refuse_active_work') return { kind: 'active_work' };
+            ready = true;
+            return { kind: 'completed' };
+          },
+        },
+      });
+    },
+  });
+  const initial = await ui.attention();
+  assert.equal(initial.reason, 'replacement_required');
+  assert.match(formatHostHandoff(initial, 'zh-CN').detail, /0\.2\.0 → 0\.3\.0/u);
+  assert.deepEqual(initial.actions, ['cancel', 'retry', 'replace']);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(observations, 1);
+  ui.choose(initial, 'retry');
+  const checked = await ui.view((view) => view.revision !== initial.revision);
+  assert.deepEqual(policies, []);
+  ui.choose(checked, 'replace');
+  const busy = await ui.view(
+    (view): view is HostHandoffAttentionView =>
+      view.state === 'attention' && view.reason === 'busy',
+  );
+  assert.deepEqual(policies, ['refuse_active_work']);
+  assert.ok(busy.actions.includes('interrupt'));
+  ui.choose(busy, 'interrupt');
+  assert.equal((await running).value, 'connected');
+  assert.deepEqual(policies, ['refuse_active_work', 'interrupt_active_work']);
 });

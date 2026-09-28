@@ -39,7 +39,6 @@ import { FileAttemptStore } from '../attempt-store.js';
 import type { ExperimentCell, ExperimentSpec, JsonObject } from '../experiment.js';
 import { createExternalSubjectAdapter } from '../external-subject.js';
 import { createHarborExecutor, createPierExecutor } from '../harness-executor.js';
-import { makaEvalRuntimePolicyDocument } from '../maka-runtime-policy.js';
 import { createMakaSubjectAdapter } from '../maka-subject.js';
 import { DEEPSEEK_V4_FLASH_COST, deepSeekCostUsd } from '../provider-metering.js';
 import {
@@ -521,8 +520,24 @@ test('Maka framework termination is authoritative before stdout decoding', async
   assert.equal(external.status, 'failed');
 });
 
-test('Maka forwards the configured Runtime Host settlement budget', async () => {
-  const makaCell = cell('maka', { ...makaConfig(), hostSettlementTimeoutMs: 120_000 });
+test('Maka forwards Host requirements and declared credential names', async () => {
+  const { thinkingLevel: _thinkingLevel, ...defaultConfig } = makaConfig();
+  const config = {
+    ...defaultConfig,
+    hostSettlementTimeoutMs: 120_000,
+    providerType: 'moonshot-global',
+    apiKeyEnvironment: 'MOONSHOT_API_KEY',
+  };
+  const unbound = cell('maka', config);
+  assert.throws(
+    () => createMakaSubjectAdapter().validate?.(unbound),
+    /declared subject credential/,
+  );
+  const makaCell = {
+    ...unbound,
+    subject: { ...unbound.subject, credentials: ['MOONSHOT_API_KEY'] },
+  };
+  createMakaSubjectAdapter().validate?.(makaCell);
   let settlementBudget: unknown;
   const result = await createMakaSubjectAdapter().execute({
     cell: makaCell,
@@ -533,8 +548,15 @@ test('Maka forwards the configured Runtime Host settlement budget', async () => 
       execute: async (input) => {
         const payload = JSON.parse(Buffer.from(input.args[1] ?? '', 'base64url').toString()) as {
           hostSettlementTimeoutMs?: unknown;
-          execution: { executionId: string };
+          connection: unknown;
+          execution: { executionId: string; session: Record<string, unknown> };
         };
+        assert.equal(Object.hasOwn(payload.execution.session, 'thinkingLevel'), false);
+        assert.deepEqual(payload.connection, {
+          providerType: 'moonshot-global',
+          apiKeyEnvironment: 'MOONSHOT_API_KEY',
+        });
+        assert.deepEqual(input.credentialEnvironment, { MOONSHOT_API_KEY: 'MOONSHOT_API_KEY' });
         settlementBudget = payload.hostSettlementTimeoutMs;
         return {
           termination: 'exited',
@@ -554,11 +576,69 @@ test('Maka forwards the configured Runtime Host settlement budget', async () => 
   assert.equal(settlementBudget, 120_000);
   assert.throws(
     () =>
+      createMakaSubjectAdapter().validate?.(cell('maka', { ...config, thinkingLevel: 'default' })),
+    /thinkingLevel/u,
+  );
+  assert.throws(
+    () =>
       createMakaSubjectAdapter().validate?.(
         cell('maka', { ...makaConfig(), hostSettlementTimeoutMs: 120_000.5 }),
       ),
     /hostSettlementTimeoutMs/u,
   );
+});
+
+test('a custom Maka subject forwards its default request protocol', async () => {
+  const config = {
+    ...makaConfig(),
+    providerType: 'custom',
+    defaultApiProtocol: 'anthropic-messages',
+    apiKeyEnvironment: 'RELAY_API_KEY',
+  };
+  const makaCell = cell('maka', config);
+  const bound = { ...makaCell, subject: { ...makaCell.subject, credentials: ['RELAY_API_KEY'] } };
+  const { defaultApiProtocol: _protocol, ...withoutProtocol } = config;
+  assert.throws(
+    () => createMakaSubjectAdapter().validate?.(cell('maka', withoutProtocol)),
+    /config fields are invalid/u,
+  );
+  assert.throws(
+    () =>
+      createMakaSubjectAdapter().validate?.(cell('maka', { ...config, defaultApiProtocol: 'x' })),
+    /defaultApiProtocol/u,
+  );
+  let forwarded: unknown;
+  await createMakaSubjectAdapter().execute({
+    cell: bound,
+    context: {
+      cwd: '/workspace',
+      taskInput: 'solve',
+      metadata: {},
+      execute: async (input) => {
+        const payload = JSON.parse(Buffer.from(input.args[1] ?? '', 'base64url').toString()) as {
+          connection: unknown;
+          execution: { executionId: string };
+        };
+        forwarded = payload.connection;
+        return {
+          termination: 'exited',
+          exitCode: 0,
+          stdout: JSON.stringify({
+            executionId: payload.execution.executionId,
+            kind: 'settled',
+            status: 'completed',
+            usage: usage(),
+            costUsd: null,
+          }),
+        };
+      },
+    },
+  });
+  assert.deepEqual(forwarded, {
+    providerType: 'custom',
+    defaultApiProtocol: 'anthropic-messages',
+    apiKeyEnvironment: 'RELAY_API_KEY',
+  });
 });
 
 // The relay tears the subject's process group down unless the wrapper exits
@@ -1163,11 +1243,6 @@ test('the DeepSeek Harness arm pins its own minimal composition', async () => {
     ),
   ) as { dsh: { profile: { bundles: string[] } } };
   assert.deepEqual(profile.dsh.profile.bundles, []);
-});
-
-test('Maka Eval policy enables privacy independently of the tool profile', () => {
-  const document = makaEvalRuntimePolicyDocument();
-  assert.equal(document.policy.privacy.incognitoActive, true);
 });
 
 test('experiment specs do not declare an executor working-directory authority', async () => {

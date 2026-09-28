@@ -18,7 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
@@ -27,12 +27,14 @@ import { PROVIDER_REGISTRY, type LlmConnection } from '@maka/core/llm-connection
 import { anthropic } from '@ai-sdk/anthropic';
 import { generateText, isStepCount, streamText, tool, type ModelMessage } from 'ai';
 import { z } from 'zod';
-import { fetchProviderModels, runConnectionModelDiscoveryEffect } from '../model-fetcher.js';
+import { runConnectionModelDiscoveryEffect } from '../model-fetcher.js';
+import { discoverModels } from './model-discovery-fixture.js';
 import { resetStreamUsageFallbackMemory } from '../stream-usage-fallback-fetch.js';
 import { buildProviderOptions, getAIModel } from '../model-factory.js';
 import { resolveOAuthSubscriptionAccessToken } from '../subscription-credentials.js';
 import { testConnection } from '../test-connection.js';
 import { ModelAdapter } from '../model-adapter.js';
+import type { ModelMessage as RuntimeModelMessage } from '../model-protocol.js';
 import { openInteractiveRuntimePolicyStoresForWrite } from '@maka/storage/runtime-policy-stores';
 import {
   resolveStorageRoot,
@@ -47,10 +49,300 @@ import {
   respondOpenAIStream,
   startJsonServer,
 } from './conformance-harness.js';
+import { runOpenAIResponsesWire } from './provider-contract-overrides.js';
 
 after(closeAllJsonServers);
 
 describe('models.dev provider conformance', () => {
+  for (const providerType of ['custom', 'openai'] as const) {
+    test(`${providerType}: Chat delivers tool images after all parallel results, including replay`, async () => {
+      const bodies: Array<{ messages: Array<Record<string, unknown>> }> = [];
+      const server = await startJsonServer(async (request, response) => {
+        bodies.push(JSON.parse(await readBody(request)));
+        respondJson(response, 400, { error: { message: 'Request captured' } });
+      });
+      const adapter = new ModelAdapter({
+        connection: {
+          slug: 'images',
+          providerType,
+          ...(providerType === 'custom' ? { defaultApiProtocol: 'openai-chat' as const } : {}),
+          defaultModel: 'image-model',
+          models: [{ id: 'image-model', apiProtocol: 'openai-chat' }],
+          baseUrl: `${server.url}/v1`,
+        },
+        modelId: 'image-model',
+        apiKey: 'test-key',
+        modelFactory: getAIModel,
+        newId: () => 'image-request',
+        now: Date.now,
+      });
+      const image = (id: string) => Buffer.from(`tool-image-${id}`).toString('base64');
+      const messages: RuntimeModelMessage[] = [
+        { role: 'user', content: 'Compare the screenshots.' },
+        {
+          role: 'assistant',
+          content: ['before', 'after'].map((id) => ({
+            type: 'tool-call',
+            toolCallId: id,
+            toolName: 'Read',
+            input: { path: `${id}.png` },
+          })),
+        },
+        ...['before', 'after'].map(
+          (id): RuntimeModelMessage => ({
+            role: 'tool',
+            content: [
+              {
+                type: 'tool-result',
+                toolCallId: id,
+                toolName: 'Read',
+                output: {
+                  type: 'content',
+                  value: [
+                    { type: 'text', text: `${id} screenshot` },
+                    {
+                      type: 'file',
+                      mediaType: 'image/png',
+                      data: { type: 'data', data: image(id) },
+                    },
+                    { type: 'text', text: `${id} caption` },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      ];
+      try {
+        for (const replay of [false, true]) {
+          if (replay)
+            messages.push(
+              { role: 'assistant', content: 'Compared.' },
+              { role: 'user', content: 'Continue.' },
+            );
+          const original = structuredClone(messages);
+          const result = await adapter.startStream({
+            model: adapter.resolveModel(),
+            messages,
+            tools: {},
+            activeTools: [],
+            onStreamActivity: () => {},
+            abortSignal: new AbortController().signal,
+            repairToolCall: () => null,
+          });
+          for await (const _event of result.events) {
+            /* capture the request */
+          }
+          await result.outcome;
+          assert.deepEqual(messages, original);
+          const wire = bodies.at(-1)!.messages;
+          assert.deepEqual(
+            wire.map((m) => m.role),
+            replay
+              ? ['user', 'assistant', 'tool', 'tool', 'user', 'assistant', 'user']
+              : ['user', 'assistant', 'tool', 'tool', 'user'],
+          );
+          assert.deepEqual(
+            wire.slice(2, 4).map((m) => m.tool_call_id),
+            ['before', 'after'],
+          );
+          for (const [index, id] of ['before', 'after'].entries()) {
+            const text = String(wire[index + 2]!.content);
+            assert.ok(!text.includes(image(id)));
+            assert.ok(text.includes(`${id} screenshot`) && text.includes(`${id} caption`));
+          }
+          const parts = wire[4]!.content as Array<{
+            type: string;
+            text?: string;
+            image_url?: { url: string };
+          }>;
+          assert.deepEqual(
+            parts.filter((p) => p.type === 'image_url').map((p) => p.image_url?.url),
+            ['before', 'after'].map((id) => `data:image/png;base64,${image(id)}`),
+          );
+          const labels = parts
+            .filter((p) => p.type === 'text')
+            .map((p) => p.text)
+            .join('\n');
+          assert.ok(labels.includes('before') && labels.includes('after'));
+        }
+        assert.equal(bodies.length, 2);
+      } finally {
+        adapter.dispose();
+      }
+    });
+  }
+
+  for (const [providerType, modelId, apiProtocol, usesCapacityDefault] of [
+    ['openai', 'gpt-4.1', 'openai-chat', false],
+    ['openai', 'gpt-5', 'openai-responses', false],
+    ['custom', 'budget-model', 'openai-chat', false],
+    ['mistral', 'budget-model', 'openai-chat', false],
+    ['google', 'gemini-2.5-flash', undefined, false],
+    ['anthropic', 'budget-model', 'anthropic-messages', true],
+    ['kimi-coding-plan', 'kimi-for-coding', 'anthropic-messages', true],
+    ['kimi-coding-plan', 'k3', 'openai-chat', true],
+  ] as const) {
+    test(`${providerType}/${modelId}: persisted output budget reaches the wire without replacing capacity`, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'maka-output-budget-'));
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const owner = await tryAcquireInteractiveRootOwner(capability);
+      assert.ok(owner);
+      const bodies: Array<{
+        max_tokens?: number;
+        max_completion_tokens?: number;
+        max_output_tokens?: number;
+        generationConfig?: { maxOutputTokens?: number };
+      }> = [];
+      const server = await startJsonServer(async (request, response) => {
+        bodies.push(JSON.parse(await readBody(request)));
+        // Stop at the HTTP boundary: this test checks requests, not provider generation.
+        respondJson(response, 400, { error: { message: 'Request captured' } });
+      });
+      try {
+        let stores = await openInteractiveRuntimePolicyStoresForWrite(owner.lease);
+        const created = await stores.connectionCatalog.create({
+          expectedCatalogRevision: 0,
+          connection: {
+            slug: 'budget',
+            name: 'Budget',
+            providerType,
+            ...(providerType === 'custom' ? { defaultApiProtocol: 'openai-chat' as const } : {}),
+            baseUrl: `${server.url}/v1`,
+            enabled: true,
+            enabledModelIds: [modelId],
+            modelOverrides: { [modelId]: { maxOutputTokens: 8192 } },
+          },
+        });
+        assert.equal(created.kind, 'committed');
+        if (created.kind !== 'committed') throw new Error('Connection was not created');
+        const connectionId = created.snapshot.connections[0]!.connectionId;
+        assert.equal(
+          (
+            await stores.credentialVault.set({
+              locator: { scope: 'connection', connectionId, kind: 'api_key' },
+              expected: null,
+              secret: 'test-key',
+            })
+          ).kind,
+          'committed',
+        );
+        const fetch = await stores.operations.beginModelFetch(connectionId);
+        assert.equal(fetch.kind, 'ready');
+        if (fetch.kind !== 'ready') throw new Error('Discovery was not admitted');
+        assert.equal(
+          (
+            await stores.operations.completeModelFetch(fetch.ticket, {
+              models: [
+                { id: modelId, maxOutputTokens: 16384, ...(apiProtocol ? { apiProtocol } : {}) },
+              ],
+              source: 'fetched',
+              fetchedAt: 1,
+            })
+          ).kind,
+          'committed',
+        );
+        for (const budget of [8192, 32768, undefined]) {
+          const snapshot = await stores.connectionCatalog.getSnapshot();
+          const current = snapshot.connections[0]!;
+          assert.equal(
+            (
+              await stores.connectionCatalog.update({
+                expected: {
+                  connectionId,
+                  revision: current.revision,
+                },
+                changes: {
+                  name: current.name,
+                  baseUrl: current.baseUrl,
+                  enabled: current.enabled,
+                  enabledModelIds: current.enabledModelIds,
+                  modelOverrides: {
+                    [modelId]: budget === undefined ? {} : { maxOutputTokens: budget },
+                  },
+                },
+              })
+            ).kind,
+            'committed',
+          );
+          stores = await openInteractiveRuntimePolicyStoresForWrite(owner.lease);
+          const prepared = await stores.operations.resolveExecutionConnection({
+            kind: 'catalog_slug',
+            connectionSlug: 'budget',
+          });
+          assert.equal(prepared.kind, 'ready');
+          if (prepared.kind !== 'ready') throw new Error('Execution was not admitted');
+          assert.equal(
+            prepared.connection.models.find((m) => m.id === modelId)?.maxOutputTokens,
+            16384,
+          );
+          const adapter = new ModelAdapter({
+            connection: {
+              ...prepared.connection,
+              models: [...prepared.connection.models],
+              defaultModel: modelId,
+            },
+            modelId,
+            apiKey: 'test-key',
+            modelFactory: getAIModel,
+            ...(apiProtocol === 'anthropic-messages'
+              ? {
+                  providerOptions: {
+                    anthropic: { thinking: { type: 'enabled', budgetTokens: 1024 } },
+                  },
+                }
+              : {}),
+            newId: () => 'budget',
+            now: Date.now,
+          });
+          try {
+            const result = await adapter.startStream({
+              model: adapter.resolveModel(),
+              messages: [{ role: 'user', content: 'Hello' }],
+              tools: {},
+              activeTools: [],
+              onStreamActivity: () => {},
+              abortSignal: new AbortController().signal,
+              repairToolCall: () => null,
+            });
+            for await (const _event of result.events) {
+              /* drain to the HTTP response */
+            }
+            await result.outcome;
+          } finally {
+            adapter.dispose();
+          }
+          const body = bodies.at(-1)!;
+          assert.ok(body, 'the production adapter must make an HTTP request');
+          const sentLimit =
+            body.max_tokens ??
+            body.max_completion_tokens ??
+            body.max_output_tokens ??
+            body.generationConfig?.maxOutputTokens;
+          assert.equal(
+            sentLimit,
+            budget === undefined
+              ? usesCapacityDefault
+                ? 16384
+                : undefined
+              : Math.min(budget, 16384),
+          );
+        }
+        assert.equal(bodies.length, 3);
+      } finally {
+        await owner.close();
+        await rm(root, { recursive: true, force: true });
+        await rm(join(resolveRootControlNamespace(), capability.rootId), {
+          recursive: true,
+          force: true,
+        });
+        await rm(join(resolveRootOwnershipNamespace(), `${capability.rootId}.lock`), {
+          force: true,
+        });
+      }
+    });
+  }
+
   test('mixed discovery survives persistence and user overrides through both SDK tool loops', async () => {
     const root = await mkdtemp(join(tmpdir(), 'maka-mixed-routing-'));
     const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
@@ -229,19 +521,30 @@ describe('models.dev provider conformance', () => {
       await discover();
       await send('claude-route');
       await send('new-route');
-      await writeFile(
-        join(root, 'model-facts.json'),
-        JSON.stringify({
-          schemaVersion: 1,
-          overrides: { 'commandcode:new-route': { apiProtocol: 'anthropic-messages' } },
-        }),
-      );
+      const overrideProtocol = async (enabled: boolean) => {
+        const current = (await stores.connectionCatalog.getSnapshot()).connections[0]!;
+        assert.equal(
+          (
+            await stores.connectionCatalog.update({
+              expected: { connectionId, revision: current.revision },
+              changes: {
+                name: current.name,
+                baseUrl: current.baseUrl,
+                enabled: current.enabled,
+                enabledModelIds: current.enabledModelIds,
+                modelOverrides: enabled
+                  ? { 'new-route': { apiProtocol: 'anthropic-messages' } }
+                  : null,
+              },
+            })
+          ).kind,
+          'committed',
+        );
+      };
+      await overrideProtocol(true);
       await discover();
       await send('new-route');
-      await writeFile(
-        join(root, 'model-facts.json'),
-        JSON.stringify({ schemaVersion: 1, overrides: {} }),
-      );
+      await overrideProtocol(false);
       await send('new-route');
       assert.deepEqual(paths, [
         '/provider/v1/messages:claude-route',
@@ -353,12 +656,12 @@ describe('models.dev provider conformance', () => {
     assert.deepEqual(requestBody?.thinking, { type: 'adaptive', display: 'summarized' });
   });
 
-  test('custom Anthropic relays request summarized thinking for known Claude models', async () => {
-    let requestBody: Record<string, unknown> | undefined;
+  test('custom Messages models request summarized thinking only for a declared level', async () => {
+    const requestBodies: Record<string, unknown>[] = [];
     const server = await startJsonServer(async (request, response) => {
       assert.equal(request.method, 'POST');
       assert.equal(request.url, '/v1/messages');
-      requestBody = JSON.parse(await readBody(request)) as Record<string, unknown>;
+      requestBodies.push(JSON.parse(await readBody(request)) as Record<string, unknown>);
       respondJson(response, 200, {
         id: 'msg_anthropic_relay',
         type: 'message',
@@ -373,26 +676,39 @@ describe('models.dev provider conformance', () => {
     const connection: LlmConnection = {
       slug: 'anthropic-relay',
       name: 'Anthropic Relay',
-      providerType: 'anthropic-compatible',
+      providerType: 'custom',
+      defaultApiProtocol: 'anthropic-messages',
       baseUrl: server.url,
       defaultModel: 'claude-opus-4-8',
       enabled: true,
       createdAt: 1,
       updatedAt: 1,
     };
+    const declared: LlmConnection = {
+      ...connection,
+      modelOverrides: { 'claude-opus-4-8': { thinkingLevels: ['low', 'high'] } },
+    };
 
-    await generateText({
-      model: getAIModel({
-        connection,
-        apiKey: 'relay-key',
-        modelId: connection.defaultModel,
-      }),
-      prompt: 'Hello.',
-      providerOptions: buildProviderOptions(connection, connection.defaultModel),
-    });
+    for (const [target, level] of [
+      [connection, undefined],
+      [declared, 'high'],
+    ] as const) {
+      await generateText({
+        model: getAIModel({
+          connection: target,
+          apiKey: 'relay-key',
+          modelId: target.defaultModel,
+        }),
+        prompt: 'Hello.',
+        providerOptions: buildProviderOptions(target, target.defaultModel, level),
+      });
+    }
 
-    assert.deepEqual(requestBody?.thinking, { type: 'adaptive', display: 'summarized' });
-    assert.equal(requestBody?.cache_control, undefined);
+    assert.equal(requestBodies.length, 2);
+    assert.equal(requestBodies[0]?.thinking, undefined);
+    assert.deepEqual(requestBodies[1]?.thinking, { type: 'adaptive', display: 'summarized' });
+    assert.deepEqual(requestBodies[1]?.output_config, { effort: 'high' });
+    for (const body of requestBodies) assert.equal(body.cache_control, undefined);
   });
 
   test('Anthropic request bodies follow the SDK adaptive-thinking capability', async () => {
@@ -421,8 +737,12 @@ describe('models.dev provider conformance', () => {
       },
       {
         modelId: 'anthropic/claude-opus-4.5',
-        providerType: 'anthropic-compatible' as const,
-        expectedThinking: { type: 'enabled', budget_tokens: 1_024 },
+        providerType: 'custom' as const,
+        defaultApiProtocol: 'anthropic-messages' as const,
+        thinkingLevel: 'high' as const,
+        declaredThinkingLevels: ['high'] as const,
+        expectedThinking: { type: 'adaptive', display: 'summarized' },
+        expectedOutputConfig: { effort: 'high' },
       },
     ];
 
@@ -445,6 +765,14 @@ describe('models.dev provider conformance', () => {
         slug: `${testCase.providerType}-${testCase.modelId}`,
         name: testCase.modelId,
         providerType: testCase.providerType,
+        ...(testCase.defaultApiProtocol && testCase.declaredThinkingLevels
+          ? {
+              defaultApiProtocol: testCase.defaultApiProtocol,
+              modelOverrides: {
+                [testCase.modelId]: { thinkingLevels: [...testCase.declaredThinkingLevels] },
+              },
+            }
+          : {}),
         baseUrl: server.url,
         defaultModel: testCase.modelId,
         enabled: true,
@@ -552,9 +880,10 @@ describe('models.dev provider conformance', () => {
       });
     });
     const connection: LlmConnection = {
-      slug: 'anthropic-compatible-search-replay',
-      name: 'Anthropic-compatible Search Replay',
-      providerType: 'anthropic-compatible',
+      slug: 'custom-messages-search-replay',
+      name: 'Custom Messages Search Replay',
+      providerType: 'custom',
+      defaultApiProtocol: 'anthropic-messages',
       baseUrl: server.url,
       defaultModel: 'deepseek-v4-flash',
       enabled: true,
@@ -810,7 +1139,7 @@ describe('models.dev provider conformance', () => {
       createdAt: 1,
       updatedAt: 1,
     };
-    connection.models = await fetchProviderModels(connection, 'github-account-token');
+    connection.models = await discoverModels(connection, 'github-account-token');
     assert.deepEqual(connection.models.map((model) => model.id).sort(), [
       'claude-sonnet-4.6',
       'gpt-5.4',
@@ -1166,7 +1495,7 @@ describe('models.dev provider conformance', () => {
       updatedAt: 1,
     };
 
-    assert.deepEqual(await fetchProviderModels(connection, 'opencode-test-key'), [{ id: modelId }]);
+    assert.deepEqual(await discoverModels(connection, 'opencode-test-key'), [{ id: modelId }]);
     const result = await generateText({
       model: getAIModel({ connection, apiKey: 'opencode-test-key', modelId }),
       prompt: 'Call echo with hello.',
@@ -1236,36 +1565,6 @@ describe('models.dev provider conformance', () => {
     assert.deepEqual(requests[1]?.body.messages, [{ role: 'user', content: 'Hi' }]);
     assert.equal(requests[2]?.headers['x-goog-api-key'], 'opencode-test-key');
     assert.deepEqual(requests[2]?.body.contents, [{ role: 'user', parts: [{ text: 'Hi' }] }]);
-  });
-
-  test('OpenCode Free probes reuse identity across candidates and renew it per operation', async () => {
-    const sessions: Array<string | undefined> = [];
-    const server = await startJsonServer(async (request, response) => {
-      sessions.push(request.headers['x-opencode-session'] as string | undefined);
-      respondJson(response, sessions.length % 2 === 1 ? 429 : 200, {
-        choices: [{ message: { role: 'assistant', content: 'ok' } }],
-      });
-    });
-    const connection: LlmConnection = {
-      slug: 'opencode-free',
-      name: 'OpenCode Free',
-      providerType: 'opencode-free',
-      baseUrl: `${server.url}/zen/v1`,
-      defaultModel: 'nemotron-3-ultra-free',
-      enabledModelIds: ['nemotron-3-ultra-free', 'mimo-v2.5-free'],
-      enabled: true,
-      createdAt: 1,
-      updatedAt: 1,
-    };
-    assert.equal((await testConnection(connection, '')).ok, true);
-    assert.equal((await testConnection(connection, '')).ok, true);
-    assert.equal(sessions.length, 4);
-    for (const session of sessions) {
-      assert.match(session ?? '', /^[0-9a-f-]{36}$/);
-    }
-    assert.equal(sessions[0], sessions[1]);
-    assert.equal(sessions[2], sessions[3]);
-    assert.notEqual(sessions[0], sessions[2]);
   });
 
   test('OpenCode Go connection probes identify every supported wire request', async () => {
@@ -1417,8 +1716,21 @@ describe('models.dev provider conformance', () => {
     assert.equal(probedPath, '/v1/responses');
   });
 
+  test('custom Responses models preserve exact ids, tool results, and encrypted reasoning', async () => {
+    await runOpenAIResponsesWire({
+      providerType: 'custom',
+      defaultApiProtocol: 'openai-responses',
+      slug: 'responses-relay',
+      name: 'Responses Relay',
+      basePath: '/relay/v1',
+      modelId: 'relay-responses-model',
+      apiKey: 'responses-relay-key',
+      statelessReasoning: true,
+    });
+  });
+
   for (const [label, providerType] of [
-    ['a plain OpenAI-compatible relay', 'openai-compatible'],
+    ['a custom Chat Completions connection', 'custom'],
     ['local Ollama', 'ollama'],
   ] as const) {
     test(`${label} requests usage in streamed chat completions by default`, async () => {
@@ -1447,6 +1759,7 @@ describe('models.dev provider conformance', () => {
         slug: providerType,
         name: label,
         providerType,
+        ...(providerType === 'custom' ? { defaultApiProtocol: 'openai-chat' as const } : {}),
         baseUrl: `${server.url}/v1`,
         defaultModel: 'relay-model',
         enabled: true,
@@ -1547,7 +1860,8 @@ describe('models.dev provider conformance', () => {
     const connection: LlmConnection = {
       slug: 'strict-relay',
       name: 'Strict relay',
-      providerType: 'openai-compatible',
+      providerType: 'custom',
+      defaultApiProtocol: 'openai-chat',
       baseUrl: `${server.url}/v1`,
       defaultModel: 'relay-model',
       enabled: true,
@@ -1662,7 +1976,7 @@ describe('models.dev provider conformance', () => {
       updatedAt: 1,
     };
 
-    const models = await fetchProviderModels(connection, 'hf-test-token');
+    const models = await discoverModels(connection, 'hf-test-token');
     assert.deepEqual(models, [{ id: discoveredModelId, capabilities: { functionCalling: true } }]);
 
     const result = await generateText({

@@ -368,6 +368,25 @@ describe('generalizedErrorMessageForLocale', () => {
       '操作失败',
     );
   });
+
+  test('classifies Chromium network stack error codes as network errors', () => {
+    for (const raw of [
+      'net::ERR_CONNECTION_RESET',
+      'net::ERR_NAME_NOT_RESOLVED',
+      'net::ERR_CONNECTION_REFUSED',
+      'net::ERR_INTERNET_DISCONNECTED',
+    ]) {
+      assert.equal(generalizedErrorMessage(new Error(raw)), 'Network error');
+      assert.equal(
+        generalizedErrorMessageForLocale(new Error(raw), 'fallback', 'zh-CN'),
+        '网络错误',
+      );
+      assert.equal(
+        generalizedErrorMessageForLocale(new Error(raw), 'fallback', 'zh-TW'),
+        '網路錯誤',
+      );
+    }
+  });
 });
 
 describe('generalizedErrorMessage', () => {
@@ -391,6 +410,21 @@ describe('generalizedErrorMessage', () => {
         'Conversation copy failed',
       ),
       'Conversation copy failed',
+    );
+  });
+
+  test('does not mistake builder update metadata 404s for authentication failures', () => {
+    const error = new Error(`404 Not Found
+Please double check that your authentication token is correct. Due to security reasons, actual status maybe not reported, but 404.`);
+    Object.assign(error, { code: 'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND' });
+
+    assert.equal(
+      generalizedErrorMessage(error, 'Update metadata is unavailable'),
+      'Update metadata is unavailable',
+    );
+    assert.equal(
+      generalizedErrorMessageForLocale(error, '更新元数据不可用', 'zh-CN'),
+      '更新元数据不可用',
     );
   });
 

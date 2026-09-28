@@ -18,29 +18,21 @@
  */
 
 import {
-  captureTranscriptReadingAnchor,
   currentTranscriptRange,
-  loadTranscriptHistory,
-  newestDurablePromptSequence,
-  refreshTranscriptTurnLandmarks,
-  restoreSessionTranscriptRange,
   transcriptRestoreTarget,
 } from './controller/transcript-reading-position.js';
 
 export const transcriptReadingPosition = {
-  captureAnchor: captureTranscriptReadingAnchor,
   currentRange: currentTranscriptRange,
-  loadHistory: loadTranscriptHistory,
-  newestDurablePromptSequence,
-  refreshLandmarks: refreshTranscriptTurnLandmarks,
-  restoreRange: restoreSessionTranscriptRange,
   restoreTarget: transcriptRestoreTarget,
 };
 
-export type {
-  TranscriptHistoryGates,
-  TranscriptHistoryPending,
-} from './controller/transcript-reading-position.js';
+export {
+  TranscriptReadingPositionController,
+  type TranscriptReadingPositionCommands,
+  type TranscriptTurnIndex,
+} from './controller/transcript-reading-position-controller.js';
+
 export {
   deriveTaskReadinessNotice,
   isTaskSubmissionHardBlocked,
@@ -48,12 +40,45 @@ export {
   type TaskReadinessNotice,
 } from './model/task-readiness-notice.js';
 export * from './model/session-ui-state.js';
-export type { ConversationServices } from './ports.js';
+export type { ConversationHostChange, ConversationServices } from './ports.js';
 export { ConversationServicesProvider } from './services.js';
 export { SessionLocalMessages } from './controller/session-local-messages.js';
-export { restoreTranscriptTailAfterSend } from './controller/transcript-reading-position.js';
+export { createConversationDisplayFrameScheduler } from './controller/display-frame-scheduler.js';
+export {
+  useAppShellSessionUiState,
+  type TranscriptPublisher,
+} from './controller/use-app-shell-session-ui-state.js';
 
 export { useComposerAttachments, type ComposerAttachmentService } from './controller/use-composer-attachments.js';
-export { toComposerIngestItems, retainedAttachmentRefs, type PendingAttachment } from '@maka/ui/composer-attachments';
-export { NEW_TASK_PENDING_KEY, selectPending, appendPending, removePending, removePendingItems, clearPending, type PendingByKey } from '@maka/ui/pending-items';
+export { type PendingAttachment, toSubmittedAttachments } from '@maka/ui/composer-attachments';
+export {
+  NEW_TASK_PENDING_KEY,
+  selectPending,
+  appendPending,
+  removePending,
+  removePendingItems,
+  clearPending,
+} from '@maka/ui/pending-items';
 export { desktopSlashCommandPresentation } from './model/slash-command-presentation.js';
+export { useComposerQuotes } from './controller/use-composer-quotes.js';
+export { useActiveExecutionBoundary } from './controller/use-active-execution-boundary.js';
+export { useSessionReferenceComposer } from './controller/use-session-reference-composer.js';
+export {
+  ComposerMentionsProvider,
+  useComposerMentionsContext,
+  type ComposerMentions,
+  type ComposerMentionsSurface,
+} from './ui/composer-mentions-provider.js';
+
+export { activeHostTurn, chatTurnActivity } from '../../application/contracts/session-execution.js';
+export { selectLiveTurns, sessionUiSelectors } from './model/session-ui-selectors.js';
+export { LiveTurnReconciler } from './controller/live-turn-reconciler.js';
+export { sessionIdSetsEqual, type LiveTurnSnapshot } from './model/live-turn-snapshot.js';
+
+export { useExecutorSelection } from './controller/use-executor-selection.js';
+export * from './model/shell-chat-model-selection.js';
+export * from './model/session-health-notice.js';
+export * from './controller/use-new-task-choice.js';
+export * from './controller/use-shell-chat-model.js';
+export * from './model/executor-submission.js';
+export * from './model/executor-composer.js';

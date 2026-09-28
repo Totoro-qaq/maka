@@ -85,17 +85,20 @@ import { runtimeHostLogBuffer } from '../process-diagnostics.js';
 import {
   type HostCompositionDescriptor,
   type RuntimeHostCompositionSource,
-} from './host-composition.js';
+} from './host-composition-source.js';
 import {
   startLocalRuntimeHostListenerSet,
   type RuntimeHostListenerConnection,
   type RuntimeHostListenerSet,
   type RuntimeHostListenerSetFactory,
 } from './listener-set.js';
-import { HostResidencyRegistry } from './host-residency-registry.js';
+import { HostResidencyRegistry, type HostResidencyKind } from './host-residency-registry.js';
 import type { PeerMeshNode } from '../peer-mesh/node.js';
 import { createPeerMeshOperationHandlers } from './peer-mesh-authority.js';
 import { createHostResourceCollector } from './host-resource-collector.js';
+import { RuntimeHostProcessTerminationRequiredError } from './process-termination-error.js';
+
+export { RuntimeHostProcessTerminationRequiredError } from './process-termination-error.js';
 
 const DEFAULT_IDLE_GRACE_MS = 30_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -110,19 +113,11 @@ const HOST_PROTOCOL = {
 
 export type RuntimeHostResidency = OperationResidency;
 
-export class RuntimeHostProcessTerminationRequiredError extends Error {
-  readonly code = 'process_termination_required';
-
-  constructor(readonly shutdownGraceMs: number) {
-    super(`Runtime Host did not shut down within ${shutdownGraceMs} ms`);
-    this.name = 'RuntimeHostProcessTerminationRequiredError';
-  }
-}
-
 export interface RuntimeHostCompositionContext {
   owner: InteractiveRootOwner;
   hostEpoch: string;
-  acquireResidency(label: string): RuntimeHostResidency;
+  /** Idle retention keeps schedulers alive without claiming work is in flight. */
+  acquireResidency(label: string, kind?: HostResidencyKind): RuntimeHostResidency;
   /** Irreversible fail-stop latch; normal residency still uses acquireResidency(). */
   retainUntilProcessExit(): void;
   requestDrain(): void;
@@ -181,8 +176,6 @@ interface RuntimeHostKernelCommonOptions {
     isClientAdmitted(clientInstanceId: string): boolean;
   };
 }
-
-export type RuntimeHostLifecycleMode = 'ephemeral' | 'service';
 
 export type RuntimeHostKernelOptions = RuntimeHostKernelCommonOptions &
   (
@@ -390,7 +383,7 @@ export class RuntimeHostKernel {
         this.#composition = await this.#options.composition.create({
           owner: this.#options.owner,
           hostEpoch: this.hostEpoch,
-          acquireResidency: (label) => this.#acquireResidency(label),
+          acquireResidency: (label, kind) => this.#acquireResidency(label, kind),
           retainUntilProcessExit: () => this.#retainUntilProcessExit(),
           requestDrain: () => this.#requestDrain(),
           ...(this.#options.accessAuthority
@@ -697,8 +690,8 @@ export class RuntimeHostKernel {
     this.#settleLifecycleAfterWork();
   }
 
-  #acquireResidency(label: string): RuntimeHostResidency {
-    const residency = this.#residencies.acquire(label, 'drain', () =>
+  #acquireResidency(label: string, kind: HostResidencyKind = 'drain'): RuntimeHostResidency {
+    const residency = this.#residencies.acquire(label, kind, () =>
       this.#settleLifecycleAfterWork(),
     );
     this.#cancelIdle();

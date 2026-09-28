@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 import { build } from 'esbuild';
+import { deferred } from '@maka/core/test-only/async-primitives';
 import type { MakaBridge } from '../../preload/bridge-contract.js';
 
 test('onboarding and workspace search never fan out Owner IPC to a ready Guest', async () => {
@@ -35,15 +36,22 @@ test('onboarding and workspace search never fan out Owner IPC to a ready Guest',
     profileName: 'Shared', profileKind: 'remote', profileAccess: 'session_guest', readiness: 'ready',
   };
   const calls: { channel: string; hostId?: string }[] = [];
+  const pendingSearch = deferred<never>();
+  const searchStarted = deferred<void>();
+  let searchRequestId: unknown;
+  let cancelRequestId: unknown;
   const ipcRenderer = {
     on() {}, off() {}, send() {},
-    async invoke(channel: string, scope?: { hostId?: string }) {
+    async invoke(channel: string, scope?: { hostId?: string }, payload?: unknown, requestId?: unknown) {
       calls.push({ channel, hostId: scope?.hostId });
       // A missing Guest handler must not hold up either aggregate.
       if (scope?.hostId === guest.hostId) throw new Error('Guest has no Owner handler');
       switch (channel) {
-        case 'runtime-host:activeIdentity': return owner;
-        case 'runtime-host:identities': return [owner, guest];
+        case 'runtime-host:identities': return [
+          { ...owner, epoch: owner.targetEpoch, isDefault: true },
+          { ...guest, epoch: guest.targetEpoch, isDefault: false },
+        ];
+        case 'runtime-host:awaitReady': return { ready: true };
         case 'session-local:catalog': return [{ scope: owner, sessions: [], authoritative: true }];
         case 'onboarding:getSnapshot': return {
           state: { kind: 'ready_empty' }, milestones: [], sessions: [], connections: [],
@@ -56,8 +64,14 @@ test('onboarding and workspace search never fan out Owner IPC to a ready Guest',
             createdAt: 1, activityAt: 1, name: 'Shared Session', status: 'active',
           },
         }];
-        case 'sessions:list':
-        case 'search:thread': return [];
+        case 'sessions:list': return [];
+        case 'search:recall':
+          searchRequestId = requestId;
+          searchStarted.resolve();
+          return pendingSearch.promise;
+        case 'search:recall:cancel':
+          cancelRequestId = payload;
+          return;
         default: throw new Error('Unexpected channel: ' + channel);
       }
     },
@@ -83,9 +97,14 @@ test('onboarding and workspace search never fan out Owner IPC to a ready Guest',
   assert.equal(snapshot.sessions.length, 1);
   assert.equal(snapshot.sessions[0]!.shared, true);
   assert.equal(snapshot.sessions[0]!.name, 'Shared Session');
-  await bridge.search.thread({ query: 'hello', limit: 10, source: 'thread' });
+  const search = bridge.search.recall({ terms: ['hello'], limit: 10 }, 'search-owner');
+  await searchStarted.promise;
+  await bridge.search.cancelRecall('search-owner');
+  assert.equal((await search as { reason: string }).reason, 'aborted');
+  assert.equal(searchRequestId, 'search-owner');
+  assert.equal(cancelRequestId, searchRequestId);
   assert.equal(calls.some(call => call.hostId === guest.hostId), false);
-  for (const channel of ['onboarding:getSnapshot', 'search:thread']) {
+  for (const channel of ['onboarding:getSnapshot', 'search:recall', 'search:recall:cancel']) {
     assert.equal(calls.filter(call => call.channel === channel && call.hostId === owner.hostId).length, 1);
   }
 });

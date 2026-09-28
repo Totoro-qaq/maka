@@ -237,12 +237,26 @@ export function classifyGeneralizedError(error: unknown): GeneralizedErrorClass 
   const lower = redactSecrets(message).toLowerCase();
   if (lower.includes('timeout')) return 'timeout';
   if (lower.includes('429') || lower.includes('rate')) return 'rate_limited';
+  // builder-util-runtime appends generic authentication-token advice to HTTP
+  // 404 errors. electron-updater has already classified this particular case
+  // as a missing channel artifact, so it is not evidence of bad credentials.
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === 'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND'
+  )
+    return undefined;
   if (lower.includes('401') || lower.includes('403') || isAuthenticationErrorText(lower))
     return 'auth_failed';
   if (/\b5\d\d\b/.test(lower)) return 'provider_error';
   if (
     lower.includes('network') ||
     lower.includes('fetch') ||
+    // Chromium network stack error codes (`net::ERR_CONNECTION_RESET`,
+    // `net::ERR_NAME_NOT_RESOLVED`, ...) never match the Node errno
+    // spellings below.
+    lower.includes('net::err') ||
     lower.includes('econn') ||
     lower.includes('enotfound')
   )
@@ -291,4 +305,30 @@ export function generalizedErrorMessage(error: unknown, fallback = 'Operation fa
 
 export function isAuthenticationErrorText(message: string): boolean {
   return message.replace(/\bauthorit\w*/g, '').includes('auth');
+}
+
+const reportedFailures = new WeakSet<object>();
+
+/** Redacted diagnostics channel for unexpected operation failures. Copy
+ * catalogs live here (bare-importable) because a depended-on copy catalog may
+ * only hold bare package runtime imports. */
+export function reportUnexpectedOperation(scope: string, error: unknown): void {
+  // One failure, one diagnostic: a rejection formatted again by an outer layer
+  // is the same defect, not a second one.
+  if (typeof error === 'object' && error !== null) {
+    if (reportedFailures.has(error)) return;
+    reportedFailures.add(error);
+  }
+  const detail =
+    error instanceof Error ? (error.stack ?? `${error.name}: ${error.message}`) : String(error);
+  console.error(`[${scope}] operation failed:`, redactSecrets(detail));
+}
+
+export function unexpectedOperationFallback(
+  error: unknown,
+  fallback: string,
+  scope: string,
+): string {
+  reportUnexpectedOperation(scope, error);
+  return fallback;
 }

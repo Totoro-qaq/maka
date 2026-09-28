@@ -31,7 +31,7 @@ import type {
 import type { RuntimeEvent, RuntimeEventStatus } from '@maka/core/runtime-event';
 import { createRuntimeEventId } from '@maka/core/runtime-event';
 
-export const RUNTIME_EVENT_BACKFILL_STATE_KEY = 'makaRuntimeRecovery';
+const RUNTIME_EVENT_BACKFILL_STATE_KEY = 'makaRuntimeRecovery';
 
 export type RuntimeEventBackfillDiagnosticCode =
   | 'skipped_high_risk_message'
@@ -163,7 +163,12 @@ export function backfillRuntimeEventsFromStoredMessages(
             id: newId(),
             role: 'model',
             author: 'agent',
-            content: { kind: 'text', text: message.text },
+            ...(message.interrupted ? { modelVisibility: 'hidden' as const } : {}),
+            content: {
+              kind: 'text',
+              text: message.text,
+              ...(message.interrupted ? { interrupted: true } : {}),
+            },
             actions: { stateDelta: recoveryState(now, message) },
             refs: { storedMessageId: message.id },
           });
@@ -173,6 +178,7 @@ export function backfillRuntimeEventsFromStoredMessages(
           for (const part of parts) {
             events.push({
               ...base,
+              ...(message.interrupted ? { modelVisibility: 'hidden' as const } : {}),
               id: newId(),
               role: 'model',
               author: 'agent',

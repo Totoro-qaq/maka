@@ -20,10 +20,11 @@
 import { randomUUID } from 'node:crypto';
 import { createRunCompositionSnapshot } from '@maka/core/run-composition';
 import { resolveModelVisionSupport } from '@maka/core/model-metadata';
-import { relayModelProfile } from '@maka/core/model-thinking';
+import { modelOverride } from '@maka/core/model-thinking';
 import type { ModelCallAttempt } from '@maka/core/model-call-attempt';
 import type { ModelCallCommit } from '@maka/core/agent-run';
 import type { PermissionMode } from '@maka/core/permission';
+import { resolveCollaborationPermissionMode } from '@maka/core/collaboration';
 import { AiSdkBackend } from '@maka/runtime/ai-sdk-backend';
 import {
   buildDefaultContextBudgetPolicy,
@@ -371,6 +372,8 @@ async function buildHostAiSdkBackend(
           : {}),
         readExecutionBoundary: () =>
           input.context.store.readExecutionBoundary(input.context.sessionId),
+        readPermissionMode: async () =>
+          (await input.context.store.readHeader(input.context.sessionId)).permissionMode,
         ...(input.context.store.createSandboxBoundaryRequest
           ? {
               createSandboxBoundaryRequest: (request) =>
@@ -404,7 +407,7 @@ async function buildHostAiSdkBackend(
           target.connection.providerType,
           target.connection.models,
           target.model,
-          relayModelProfile(target.connection, target.model)?.vision,
+          modelOverride(target.connection, target.model)?.vision,
         ),
         readAttachmentBytes: createAttachmentByteReader({
           artifactStore: input.artifacts,
@@ -472,7 +475,24 @@ async function buildHostAiSdkBackend(
               ? { emitSkillCatalogTrace: context.emitSkillCatalogTrace }
               : {}),
           });
-          return { text: resolved.text, sourceRevisions: resolved.sourceRevisions };
+          return {
+            ...resolved,
+            contexts: [
+              ...(resolved.contexts ?? []),
+              {
+                name: 'runtime.environment',
+                text: [
+                  'Runtime Host environment for this turn:',
+                  JSON.stringify({
+                    cwd: context.cwd,
+                    platform: process.platform,
+                    sampledAt: new Date(context.turnStartedAt ?? Date.now()).toISOString(),
+                    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                  }),
+                ].join('\n'),
+              },
+            ],
+          };
         },
         lookupPricing: pricing,
         recordModelCallAttempt,
@@ -542,13 +562,4 @@ class HostAiSdkBackend extends AiSdkBackend {
       }
     }
   }
-}
-
-export function resolveCollaborationPermissionMode(input: {
-  readonly collaborationMode: 'agent' | 'plan';
-  readonly permissionMode: PermissionMode;
-}): PermissionMode {
-  return input.collaborationMode === 'plan' && input.permissionMode !== 'bypass'
-    ? 'explore'
-    : input.permissionMode;
 }

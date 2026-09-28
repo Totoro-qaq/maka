@@ -19,9 +19,9 @@
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { StoredMessage } from '@maka/core/session';
+import { decodeCanonicalMessage, type StoredMessage } from '@maka/core/session';
+import { foldTimeline } from '../timeline-fold.js';
 import {
-  materializeChat,
   materializeTools,
   materializeTurns,
   overlayLiveTurn,
@@ -37,6 +37,25 @@ const originalUser = {
   ts: 1,
   text: "request",
 };
+
+test('keeps interrupted and replacement responses distinct live and after reload', () => {
+  const failed = { type: 'assistant', id: 'failed', turnId: 't1', ts: 2, text: 'Partial answer', modelId: 'fixture', interrupted: true };
+  const recovered = { ...failed, id: 'recovered', ts: 3, text: 'Recovered answer', interrupted: undefined };
+  const reloaded = JSON.parse(JSON.stringify([originalUser, failed, recovered])).map(decodeCanonicalMessage);
+  let live = armLiveTurn('t1');
+  for (const message of [failed, recovered]) {
+    live = applyLiveTurnEvent(live, {
+      type: 'text_complete', id: message.id, turnId: 't1', messageId: message.id,
+      ts: message.ts, text: message.text, ...(message.interrupted ? { interrupted: true } : {}),
+    })!;
+  }
+  for (const turn of [materializeTurns(reloaded, 'en')[0], overlayLiveTurn(materializeTurns([originalUser], 'en'), live, 'en')[0]]) {
+    const responses = foldTimeline(turn!.timeline).entries.filter((entry) => entry.kind === 'text');
+    assert.deepEqual(responses.map((entry) => [entry.text, entry.interrupted === true]), [
+      ['Partial answer', true], ['Recovered answer', false],
+    ]);
+  }
+});
 const beforeAssistant = {
   type: "assistant" as const,
   id: "before-steer",
@@ -60,6 +79,22 @@ function timelineText(turn: ReturnType<typeof materializeTurns>[number] | undefi
 }
 
 describe("steering timeline", () => {
+  test('ignores old display anchors and keeps Runtime consumption order', () => {
+    const messages = [originalUser, beforeAssistant,
+      { ...steeringUser, steeringEventId: 'accepted' },
+      { ...beforeAssistant, id: 'after', ts: 5, text: 'after' },
+    ];
+    assert.deepEqual(timelineText(materializeTurns(messages, 'en')[0]), [
+      'text:before', 'user:steer', 'text:after',
+    ]);
+    const live = applyLiveTurnEvent(armLiveTurn('t1'), {
+      type: 'text_complete', id: 'answer', messageId: beforeAssistant.id, turnId: 't1', ts: 2, text: 'before',
+    });
+    assert.deepEqual(timelineText(overlayLiveTurn(materializeTurns(messages, 'en'), live, 'en')[0]), [
+      'text:before', 'user:steer', 'text:after',
+    ]);
+  });
+
   test("keeps a steering message at its conversational position", () => {
     const [turn] = materializeTurns([
       originalUser,
@@ -190,7 +225,38 @@ describe("steering timeline", () => {
   });
 });
 
-describe("materializeChat message metadata", () => {
+describe("materializeTurns message metadata", () => {
+  test("carries a renderer Stop abort source into the turn view model", () => {
+    const [turn] = materializeTurns([
+      userMsg("t-stop", 1, "continue the interrupted work"),
+      {
+        type: "turn_state",
+        id: "stop-state",
+        turnId: "t-stop",
+        ts: 2,
+        status: "aborted",
+        abortSource: "renderer.stop_button",
+      },
+    ], "en");
+
+    assert.equal(turn?.status, "aborted");
+    assert.equal(turn?.abortSource, "renderer.stop_button");
+  });
+
+  test("hides a retired provider dropping note that an old session still carries", () => {
+    const turns = materializeTurns([
+      {
+        type: "system_note",
+        id: "drop",
+        turnId: "t1",
+        ts: 1,
+        kind: "context_provider_dropping",
+        data: { inputTokens: 99_398, priorInputTokens: 134_460 },
+      },
+    ], "en");
+    assert.deepEqual(turns.flatMap((turn) => turn.notes), []);
+  });
+
   test("localizes visible system notes", () => {
     const messages: StoredMessage[] = [
       {
@@ -203,12 +269,8 @@ describe("materializeChat message metadata", () => {
     ];
 
     assert.equal(
-      materializeChat(messages, "en")[0]?.text,
+      materializeTurns(messages, "en")[0]?.notes[0]?.text,
       "Earlier context compacted.",
-    );
-    assert.equal(
-      materializeChat(messages, "zh-CN")[0]?.text,
-      "已压缩较早的上下文。",
     );
     assert.equal(
       materializeTurns(messages, "zh-CN")[0]?.notes[0]?.text,
@@ -227,7 +289,6 @@ describe("materializeChat message metadata", () => {
         inlineReferences: [],
       },
     ];
-    assert.deepEqual(materializeChat(messages, "en")[0]?.inlineReferences, []);
     assert.deepEqual(materializeTurns(messages, "en")[0]?.user?.inlineReferences, []);
   });
 
@@ -243,10 +304,6 @@ describe("materializeChat message metadata", () => {
       },
     ];
 
-    assert.deepEqual(materializeChat(messages, "en")[0]?.hostOrigin, {
-      kind: "goal",
-      goalId: "goal-1",
-    });
     assert.deepEqual(materializeTurns(messages, "en")[0]?.user?.hostOrigin, {
       kind: "goal",
       goalId: "goal-1",
@@ -346,7 +403,6 @@ describe("flat timeline under tool projection (#1307 P1 regression)", () => {
     ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t2",
-      phase: "streamed",
       steps: [
         {
           stepId: "a1",
@@ -404,7 +460,6 @@ describe("live content over persisted partial rows", () => {
     ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t1",
-      phase: "streamed",
       steps: [
         {
           stepId: "assistant-1",
@@ -506,7 +561,6 @@ describe("live tool status over persisted", () => {
     ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t1",
-      phase: "streamed",
       steps: [
         {
           stepId: "a1",
@@ -552,7 +606,6 @@ describe("live tool status over persisted", () => {
     ], "en");
     const turns = overlayLiveTurn(settled, {
       turnId: "t1",
-      phase: "streamed",
       steps: [
         {
           stepId: "a1",

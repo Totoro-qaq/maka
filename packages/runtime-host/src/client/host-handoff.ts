@@ -24,7 +24,7 @@ import { RuntimeHostPermanentReconnectError } from './reconnect-lifecycle.js';
 import { formatHostHandoff } from './host-handoff-copy.js';
 import { redactSecrets } from '@maka/core/redaction';
 
-export type HostHandoffAction = 'cancel' | 'retry' | 'interrupt';
+export type HostHandoffAction = 'cancel' | 'retry' | 'replace' | 'interrupt';
 export type HostHandoffPhase =
   | 'checking'
   | 'staging'
@@ -47,6 +47,8 @@ export interface HostHandoffTarget {
 export interface HostHandoffReplacement {
   readonly kind: 'replace' | 'repair';
   readonly canReplaceIdle: boolean;
+  /** Managed environments require package-change consent before any replacement. */
+  readonly requiresExplicitSelection?: boolean;
   readonly canInterrupt: boolean;
   execute(
     policy: RuntimeHostRetirementMode,
@@ -60,6 +62,8 @@ export type HostHandoffReplacementResult =
   | { readonly kind: 'completed' | 'active_work' | 'changed' }
   | { readonly kind: 'recovery_required'; readonly diagnostic: string };
 
+export type HostHandoffRecoveryBlocker = 'managed' | 'owner' | 'installation' | 'identity';
+
 export interface HostHandoffBlocker {
   /** Includes all authority evidence that invalidates consent when it changes. */
   readonly identity: string;
@@ -67,7 +71,10 @@ export interface HostHandoffBlocker {
   readonly reason: 'upgrade' | 'repair' | 'unavailable';
   readonly activity?: HostActivitySnapshot;
   readonly mayExitNaturally: boolean;
+  readonly manualRecheck?: boolean;
+  readonly packageChange?: { readonly current: string; readonly target: string };
   readonly replacement?: HostHandoffReplacement;
+  readonly recoveryBlocker?: HostHandoffRecoveryBlocker;
   readonly operatorStep?: string;
   readonly diagnostic?: string;
 }
@@ -76,26 +83,41 @@ export type HostHandoffObservation<T> =
   | { readonly kind: 'ready'; readonly value: T }
   | { readonly kind: 'blocked'; readonly blocker: HostHandoffBlocker };
 
-/** Data-only projection. A Surface cannot supply policy, a target, or a transaction. */
-export interface HostHandoffView {
+export type HostHandoffReason =
+  | 'replacement_required'
+  | 'busy'
+  | 'activity_unknown'
+  | 'operator_required'
+  | 'repair_required'
+  | 'retry_required';
+
+interface HostHandoffViewBase {
   readonly revision: string;
   readonly target: HostHandoffTarget;
-  readonly state: 'attention' | 'progress';
-  readonly reason:
-    | 'busy'
-    | 'activity_unknown'
-    | 'operator_required'
-    | 'repair_required'
-    | 'retry_required';
   readonly activity?: HostActivitySnapshot;
   readonly mayExitNaturally: boolean;
+  readonly manualRecheck?: boolean;
+  readonly packageChange?: { readonly current: string; readonly target: string };
   readonly operation?: 'replace' | 'repair';
-  readonly phase?: HostHandoffPhase;
   readonly actions: readonly HostHandoffAction[];
   readonly defaultAction: 'cancel';
+  readonly recoveryBlocker?: HostHandoffRecoveryBlocker;
   readonly operatorStep?: string;
   readonly diagnostic?: string;
 }
+
+export interface HostHandoffAttentionView extends HostHandoffViewBase {
+  readonly state: 'attention';
+  readonly reason: HostHandoffReason;
+}
+
+export interface HostHandoffProgressView extends HostHandoffViewBase {
+  readonly state: 'progress';
+  readonly phase: HostHandoffPhase;
+}
+
+/** Data-only projection. A Surface cannot supply policy, a target, or a transaction. */
+export type HostHandoffView = HostHandoffAttentionView | HostHandoffProgressView;
 
 export interface HostHandoffSurface {
   update(view: HostHandoffView): void;
@@ -117,7 +139,7 @@ export class HostHandoffCancelledError extends RuntimeHostPermanentReconnectErro
 /** Noninteractive callers receive the same decision instead of prompting or silently stopping work. */
 export class HostHandoffRequiredError extends RuntimeHostPermanentReconnectError {
   readonly code = 'runtime_host_handoff_required';
-  constructor(readonly view: HostHandoffView) {
+  constructor(readonly view: HostHandoffAttentionView) {
     const copy = formatHostHandoff(view, 'en');
     super([copy.title, copy.description, copy.detail, view.diagnostic].filter(Boolean).join('\n'));
     this.name = 'HostHandoffRequiredError';
@@ -145,6 +167,8 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
   // (or a broken successor) into an automatic replacement storm.
   const attempted = new Set<string>();
   let automaticAttempts = 0;
+  let refusedWork: string | undefined;
+  let replacementCompleted = false;
   let recovery: { identity: string; diagnostic: string } | undefined;
   const publish = (next: HostHandoffView) => {
     view = next;
@@ -185,7 +209,10 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
             target: view.target,
             reason: 'unavailable',
             mayExitNaturally: false,
-            diagnostic: boundedDiagnostic(error),
+            ...(view.manualRecheck ? { manualRecheck: true } : {}),
+            diagnostic: replacementCompleted
+              ? `Host replacement completed, but reconnection failed: ${boundedDiagnostic(error)}`
+              : boundedDiagnostic(error),
           },
         };
       }
@@ -206,13 +233,21 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
       if ((choice as { action: HostHandoffAction } | undefined)?.action === 'cancel') {
         throw new HostHandoffCancelledError();
       }
-      const blocker = observed.blocker;
+      const blocker: HostHandoffBlocker = observed.blocker;
       if (recovery?.identity !== blocker.identity) recovery = undefined;
+      if (refusedWork !== blocker.identity) refusedWork = undefined;
       const nextSignature = blockerSignature(blocker);
       if (signature !== nextSignature) {
         signature = nextSignature;
         choice = undefined;
-        publish(projectBlocker(blocker, randomUUID(), recovery?.diagnostic));
+        publish(
+          projectBlocker(
+            blocker,
+            randomUUID(),
+            recovery?.diagnostic,
+            refusedWork === blocker.identity,
+          ),
+        );
       }
       const current = view!;
       const selected = choice as { revision: string; action: HostHandoffAction } | undefined;
@@ -227,13 +262,20 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
         !recovery &&
         automaticAttempts < 3 &&
         !attempted.has(nextSignature) &&
+        !blocker.replacement?.requiresExplicitSelection &&
         blocker.replacement?.canReplaceIdle &&
         blocker.activity &&
         (isHostActivityIdle(blocker.activity) || cooperative);
       const interrupt = selected?.revision === current.revision && selected.action === 'interrupt';
+      const replace = selected?.revision === current.revision && selected.action === 'replace';
       const retry = selected?.revision === current.revision && selected.action === 'retry';
       if (
-        (automatic || interrupt || (retry && blocker.replacement?.canReplaceIdle)) &&
+        (automatic ||
+          interrupt ||
+          replace ||
+          (retry &&
+            !blocker.replacement?.requiresExplicitSelection &&
+            blocker.replacement?.canReplaceIdle)) &&
         blocker.replacement
       ) {
         if (automatic) {
@@ -246,11 +288,13 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
           : attemptAbort.signal;
         const progress = (phase: HostHandoffPhase) =>
           publish({
-            ...current,
             revision: randomUUID(),
+            target: current.target,
             state: 'progress',
             phase: cooperative && !interrupt && phase === 'retiring' ? 'pausing' : phase,
             actions: cancelled ? [] : ['cancel'],
+            defaultAction: 'cancel',
+            mayExitNaturally: false,
           });
         if (input.openSurface) surface ??= input.openSurface(submit);
         progress(cooperative && !interrupt ? 'pausing' : 'checking');
@@ -269,6 +313,8 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
         } finally {
           attemptAbort = undefined;
         }
+        replacementCompleted = result.kind === 'completed';
+        refusedWork = result.kind === 'active_work' ? blocker.identity : undefined;
         recovery =
           result.kind === 'recovery_required'
             ? { identity: blocker.identity, diagnostic: result.diagnostic.slice(0, 8_192) }
@@ -285,7 +331,12 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
         signature = undefined;
         continue;
       }
-      const attention = projectBlocker(blocker, current.revision, recovery?.diagnostic);
+      const attention = projectBlocker(
+        blocker,
+        current.revision,
+        recovery?.diagnostic,
+        refusedWork === blocker.identity,
+      );
       if (!input.openSurface) throw new HostHandoffRequiredError(attention);
       surface ??= input.openSurface(submit);
       publish(attention);
@@ -298,7 +349,7 @@ export async function runHostHandoff<T extends { close(): Promise<void> }>(input
           else resolve();
         };
         const abort = () => finish(input.signal?.reason);
-        const timer = setTimeout(finish, interval);
+        const timer = blocker.manualRecheck ? undefined : setTimeout(finish, interval);
         wake = () => finish();
         input.signal?.addEventListener('abort', abort, { once: true });
         if (input.signal?.aborted) abort();
@@ -314,7 +365,8 @@ function projectBlocker(
   blocker: HostHandoffBlocker,
   revision: string,
   recovery?: string,
-): HostHandoffView {
+  activeWorkRefused = false,
+): HostHandoffAttentionView {
   const replacement = blocker.replacement;
   return {
     revision,
@@ -327,16 +379,32 @@ function projectBlocker(
           ? 'repair_required'
           : !replacement
             ? 'operator_required'
-            : !blocker.activity
-              ? 'activity_unknown'
-              : isHostActivityIdle(blocker.activity)
-                ? 'retry_required'
-                : 'busy',
+            : activeWorkRefused
+              ? 'busy'
+              : replacement.requiresExplicitSelection
+                ? 'replacement_required'
+                : !blocker.activity
+                  ? 'activity_unknown'
+                  : isHostActivityIdle(blocker.activity)
+                    ? 'retry_required'
+                    : 'busy',
     ...(blocker.activity ? { activity: blocker.activity } : {}),
     mayExitNaturally: blocker.mayExitNaturally,
+    ...(blocker.manualRecheck ? { manualRecheck: true } : {}),
+    ...(blocker.packageChange ? { packageChange: blocker.packageChange } : {}),
     ...(replacement ? { operation: replacement.kind } : {}),
-    actions: replacement?.canInterrupt ? ['cancel', 'retry', 'interrupt'] : ['cancel', 'retry'],
+    actions: replacement?.requiresExplicitSelection
+      ? [
+          'cancel',
+          'retry',
+          'replace',
+          ...(activeWorkRefused && replacement.canInterrupt ? ['interrupt' as const] : []),
+        ]
+      : replacement?.canInterrupt
+        ? ['cancel', 'retry', 'interrupt']
+        : ['cancel', 'retry'],
     defaultAction: 'cancel',
+    ...(blocker.recoveryBlocker ? { recoveryBlocker: blocker.recoveryBlocker } : {}),
     ...(blocker.operatorStep ? { operatorStep: blocker.operatorStep } : {}),
     ...((recovery ?? blocker.diagnostic)
       ? { diagnostic: redactSecrets((recovery ?? blocker.diagnostic)!).slice(0, 8_192) }
@@ -355,7 +423,11 @@ function blockerSignature(blocker: HostHandoffBlocker): string {
     blocker.replacement?.kind,
     blocker.replacement?.canReplaceIdle,
     blocker.replacement?.canInterrupt,
+    blocker.replacement?.requiresExplicitSelection,
+    blocker.manualRecheck,
+    blocker.packageChange,
     blocker.operatorStep,
+    blocker.recoveryBlocker,
     blocker.diagnostic,
   ]);
 }

@@ -43,6 +43,7 @@ import {
   type OperationKey,
   type SessionAssistantStreamIdentity,
   type SessionCatalogProjection,
+  type SessionCatalogChangedFrame,
   type SessionContinuitySnapshot,
   type SubscriptionFrame,
 } from '@maka/runtime-host/protocol';
@@ -394,6 +395,28 @@ test('routes Guest catalog changes through the mount projection authority', asyn
   await candidate.close();
 });
 
+test('owner and Guest candidates notify without opening a conversation and detach on close', async () => {
+  for (const access of ['owner', 'session_guest'] as const) {
+    const host = connectionHarness(access);
+    const notifications: unknown[] = [];
+    const candidate = await createCandidate(
+      host.connection,
+      {
+        ...deps(ipcHarness()),
+        onGuestSessionCatalogChanged: () => {},
+        notifyRun: async (input) => { notifications.push(input); },
+      },
+      undefined, 'external', 'remote', access,
+    );
+    host.publishSessionCatalogChange('session-' + access, { kind: 'waiting', eventId: 'question-1', body: 'Answer?' });
+    await pollFor(() => notifications.length === 1, { timeoutMs: 1000 });
+    assert.equal((notifications[0] as { body: string }).body, 'Answer?');
+    await candidate.close();
+    host.publishSessionCatalogChange('session-' + access, { kind: 'completed', eventId: 'terminal-1' });
+    assert.equal(notifications.length, 1);
+  }
+});
+
 test('rejects a stale Host identity when raw Session IDs collide', async () => {
   const ipc = ipcHarness();
   const browserReleased: string[] = [];
@@ -405,7 +428,7 @@ test('rejects a stale Host identity when raw Session IDs collide', async () => {
       browserReleased.push(sessionId);
     },
     computerUseTools: emptyComputerUseTools(),
-    releaseComputerUseSession: (sessionId) => {
+    releaseDesktopInteractionSession: (sessionId) => {
       computerReleased.push(sessionId);
     },
   };
@@ -562,7 +585,7 @@ test('starts without registering an empty native capability set', async () => {
       resolveBrowserUrl: () => 'https://example.com/',
       releaseBrowserSession() {},
       computerUseTools: emptyComputerUseTools(),
-      releaseComputerUseSession() {},
+      releaseDesktopInteractionSession() {},
     }),
   );
 
@@ -582,7 +605,7 @@ test('refreshes native capabilities with a new immutable provider snapshot', asy
       resolveBrowserUrl: () => 'https://example.com/',
       releaseBrowserSession() {},
       computerUseTools: emptyComputerUseTools(),
-      releaseComputerUseSession() {},
+      releaseDesktopInteractionSession() {},
       additionalGroups: () => {
         const value = implementation;
         return [
@@ -639,7 +662,7 @@ test('releases all native Session resources on retirement and generation close',
         browserReleased.push(sessionId);
       },
       computerUseTools: emptyComputerUseTools(),
-      releaseComputerUseSession: (sessionId) => {
+      releaseDesktopInteractionSession: (sessionId) => {
         computerReleased.push(sessionId);
       },
     }),
@@ -714,16 +737,16 @@ test('drains an accepted Host-backed Bot turn before closing its generation', as
 
 test('rolls back only candidate-owned IPC after a registration collision', async () => {
   const ipc = ipcHarness();
-  ipc.handle('deepResearch:get', async () => 'embedded');
+  ipc.handle('todo:read', async () => 'embedded');
   const host = connectionHarness('collision');
 
   await assert.rejects(
     () => createDesktopRuntimeHostCandidate(host.connection, deps(ipc)),
-    /duplicate handler: deepResearch:get/,
+    /duplicate handler: todo:read/,
   );
 
-  assert.equal(await ipc.invoke('deepResearch:get'), 'embedded');
-  assert.deepEqual(ipc.channels, ['deepResearch:get']);
+  assert.equal(await ipc.invoke('todo:read'), 'embedded');
+  assert.deepEqual(ipc.channels, ['todo:read']);
   assert.equal(host.closeCalls, 1);
 });
 
@@ -744,7 +767,7 @@ test('closes the claimed Host connection when native capability construction fai
           resolveBrowserUrl: () => 'https://example.com/',
           releaseBrowserSession() {},
           computerUseTools: emptyComputerUseTools(),
-          releaseComputerUseSession() {},
+          releaseDesktopInteractionSession() {},
         }),
       ),
     /tool schema root must be an object/,
@@ -776,7 +799,7 @@ test('isolates an invalid dynamic MCP tool without dropping the Host connection'
       resolveBrowserUrl: () => 'https://example.com/',
       releaseBrowserSession() {},
       computerUseTools: emptyComputerUseTools(),
-      releaseComputerUseSession() {},
+      releaseDesktopInteractionSession() {},
       additionalGroups: () => [
         {
           offerId: 'desktop_mcp',
@@ -818,7 +841,7 @@ test('does not release or report a Revision the Host retained during cleanup', a
         released.push(`browser:${sessionId}`);
       },
       computerUseTools: emptyComputerUseTools(),
-      releaseComputerUseSession: (sessionId) => {
+      releaseDesktopInteractionSession: (sessionId) => {
         released.push(`computer:${sessionId}`);
       },
     }),
@@ -866,7 +889,8 @@ test('resyncs Goal, exact interaction, and sidecar state after candidate replace
     firstIpc.sender.sent.some(
       ({ hostId, payload }) =>
         hostId === TEST_HOST_ID &&
-        (payload as { type?: unknown }).type === 'user_question_request',
+        (payload as { type?: unknown }).type === 'host_observation_seed'
+        && (payload as { events: Array<{ type: string }> }).events.some((event) => event.type === 'user_question_request'),
     ),
   );
   assert.equal(
@@ -912,27 +936,19 @@ test('resyncs Goal, exact interaction, and sidecar state after candidate replace
 
   const seedPendingAt = resyncs.findIndex(
     ({ channel, payload }) =>
-      channel === 'sessions:observation-seed'
-      && (payload as { sessionId?: unknown; phase?: unknown }).sessionId === 'session-1'
-      && (payload as { phase?: unknown }).phase === 'pending',
+      channel === 'sessions:event:session-1'
+      && (payload as { type?: unknown }).type === 'host_observation_pending',
   );
   const seedReadyAt = resyncs.findIndex(
     ({ channel, payload }) =>
-      channel === 'sessions:observation-seed'
-      && (payload as { sessionId?: unknown; phase?: unknown }).sessionId === 'session-1'
-      && (payload as { phase?: unknown }).phase === 'ready',
+      channel === 'sessions:event:session-1'
+      && (payload as { type?: unknown }).type === 'host_observation_seed',
   );
   assert.ok(seedPendingAt >= 0);
   assert.ok(seedReadyAt > seedPendingAt);
-  const sessionEventIndexes = resyncs.flatMap(({ channel }, index) =>
-    channel === 'sessions:event:session-1' ? [index] : [],
-  );
-  assert.ok(sessionEventIndexes.length > 0);
-  assert.ok(
-    sessionEventIndexes.every(
-      (index) => index > seedPendingAt && index < seedReadyAt,
-    ),
-  );
+  const seed = resyncs[seedReadyAt]!.payload as { execution: { available: boolean }; events: unknown[] };
+  assert.equal(seed.execution.available, true);
+  assert.ok(seed.events.length > 0);
   assert.ok(
     resyncs.some(
       ({ channel, payload }) =>
@@ -1030,12 +1046,16 @@ test('retries candidate startup when a restored observation cannot seed', async 
       ),
     /Failed to restore Session observations: session-1/,
   );
-  assert.deepEqual(
-    seedEvents
-      .filter(({ channel }) => channel === 'sessions:observation-seed')
-      .map(({ payload }) => (payload as { phase?: unknown }).phase),
-    ['pending'],
-  );
+  // Restore startup and subscription failure may both invalidate observation.
+  // Neither is evidence that the Host Turn ended or observation became ready.
+  const failureEvents = seedEvents
+    .filter(({ channel }) => channel === 'sessions:event:session-1')
+    .map(({ payload }) => payload as { type?: unknown; message?: unknown });
+  assert.ok(failureEvents.some((event) =>
+    event.type === 'host_observation_error' && event.message === 'restore failed'));
+  assert.ok(failureEvents.some((event) => event.type === 'host_observation_pending'));
+  assert.ok(failureEvents.every((event) =>
+    event.type === 'host_observation_error' || event.type === 'host_observation_pending'));
   seedEvents.length = 0;
 
   const recoveredHost = connectionHarness('restore-recovered', {
@@ -1057,25 +1077,16 @@ test('retries candidate startup when a restored observation cannot seed', async 
   );
   const pendingAt = seedEvents.findIndex(
     ({ channel, payload }) =>
-      channel === 'sessions:observation-seed'
-      && (payload as { phase?: unknown }).phase === 'pending',
+      channel === 'sessions:event:session-1'
+      && (payload as { type?: unknown }).type === 'host_observation_pending',
   );
   const readyAt = seedEvents.findIndex(
     ({ channel, payload }) =>
-      channel === 'sessions:observation-seed'
-      && (payload as { phase?: unknown }).phase === 'ready',
+      channel === 'sessions:event:session-1'
+      && (payload as { type?: unknown }).type === 'host_observation_seed',
   );
   assert.ok(pendingAt >= 0);
   assert.ok(readyAt > pendingAt);
-  const catchUpEventIndexes = seedEvents.flatMap(({ channel }, index) =>
-    channel === 'sessions:event:session-1' ? [index] : [],
-  );
-  assert.ok(catchUpEventIndexes.length > 0);
-  assert.ok(
-    catchUpEventIndexes.every(
-      (index) => index > pendingAt && index < readyAt,
-    ),
-  );
   await recoveredCandidate.close();
   await observations.close();
 });
@@ -1255,10 +1266,14 @@ function deps(
     resolveBrowserUrl: () => 'https://example.com/',
     releaseBrowserSession() {},
     computerUseTools: emptyComputerUseTools(),
-    releaseComputerUseSession() {},
+    releaseDesktopInteractionSession() {},
   },
 ): DesktopRuntimeHostCandidateDeps {
   return {
+    mainWindowController: {
+      showSaveDialog: async () => ({ canceled: true }),
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+    },
     ipcMain,
     workspaceRoot: '/workspace',
     attachmentApprovals: createAttachmentApprovalRegistry(),
@@ -1270,8 +1285,10 @@ function deps(
       workspace: { kind: 'host_path', path: '/workspace' },
     }),
     resolveSessionCreateProject: async () => ({ kind: 'host_path', path: '/workspace' }),
+    resolveExternalSessionImportWorkspace: async () => ({ kind: 'host_path', path: '/workspace' }),
     emitSessionsChanged() {},
-    completeComputerUseTurn() {},
+    completeDesktopInteractionTurn() {},
+    notifyRun: async () => {},
     createSessionCopyCleanup: () => ({
       ownCreation: (_creation, operation) => operation(),
       rejectCreation: async () => undefined,
@@ -1320,7 +1337,7 @@ function connectionHarness(
     resolveTurnStarted = resolve;
   });
   const closeSubscriptions = new Set<() => void>();
-  const sessionCatalogListeners = new Set<(frame: { sessionId: string }) => void>();
+  const sessionCatalogListeners = new Set<(frame: SessionCatalogChangedFrame) => void>();
   let provider: ClientCapabilityProvider | undefined;
   let capabilityRegistrations = 0;
   let capabilityUnregistrations = 0;
@@ -1450,12 +1467,23 @@ function connectionHarness(
       if (options.subscriptionError) throw options.subscriptionError;
       const subscriptionFrames = new AsyncFrameQueue();
       activeSubscriptionFrames = subscriptionFrames;
-      const closeSubscription = () => { subscriptionFrames.end(); ptyListeners.clear(); };
+      // The Host holds a subscription's frames until the subscriber calls
+      // ready(), so handing them over earlier would let an ordering bug pass.
+      let releaseFrames = (): void => undefined;
+      const readyGate = new Promise<void>((resolve) => {
+        releaseFrames = resolve;
+      });
+      let closed = false;
+      const closeSubscription = () => {
+        closed = true;
+        subscriptionFrames.end();
+        ptyListeners.clear();
+        releaseFrames();
+      };
       closeSubscriptions.add(closeSubscription);
       const emptyPage = {
         kind: 'page' as const,
         sessionId,
-        source: 'durable' as const,
         direction: 'older' as const,
         throughSequence: null,
         rawBytes: 0,
@@ -1476,15 +1504,17 @@ function connectionHarness(
         activeAssistantStreams: options.activeAssistantStreams ?? [],
         transcriptBootstrap: {
           throughSequence: null,
-          overlayMessageCount: 0,
           durable: emptyPage,
-          overlay: { ...emptyPage, source: 'overlay' },
         },
         loadTranscript: async () => [],
-        loadTranscriptOverlay: async () => [],
         decodeTranscriptPage: async () => ({ messages: [], nextCursor: null }),
         loadTranscriptPage: async () => emptyPage,
-        [Symbol.asyncIterator]: () => subscriptionFrames[Symbol.asyncIterator](),
+        [Symbol.asyncIterator]: async function* () {
+          await readyGate;
+          if (closed) return;
+          yield* subscriptionFrames;
+        },
+        ready: async () => releaseFrames(),
         close: async () => closeSubscription(),
       };
     },
@@ -1497,7 +1527,7 @@ function connectionHarness(
       capabilityUnregistrations += 1;
       return { registrationId: `registration-${label}`, revision: 2 };
     },
-    subscribeSessionCatalogChanges: (listener: (frame: { sessionId: string }) => void) => {
+    subscribeSessionCatalogChanges: (listener: (frame: SessionCatalogChangedFrame) => void) => {
       sessionCatalogListeners.add(listener);
       return () => sessionCatalogListeners.delete(listener);
     },
@@ -1528,8 +1558,8 @@ function connectionHarness(
       }
       activeSubscriptionFrames.push(frame);
     },
-    publishSessionCatalogChange: (sessionId: string) => {
-      for (const listener of sessionCatalogListeners) listener({ sessionId });
+    publishSessionCatalogChange: (sessionId: string, attention?: SessionCatalogChangedFrame['attention']) => {
+      for (const listener of sessionCatalogListeners) listener({ kind: 'session.catalog.changed', revision: 1, sessionId, ...(attention ? { attention } : {}) });
     },
     get capabilityRegistrations() {
       return capabilityRegistrations;

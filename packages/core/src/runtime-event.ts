@@ -33,6 +33,7 @@
  * projection, or ledger logic lives here. Those arrive in later nodes.
  */
 
+import { isWorkHubActionReceipt, type WorkHubActionReceipt } from './workhub-action-result.js';
 import { isModelRetryDecision, type ModelRetryDecision } from './model-failure.js';
 
 import {
@@ -41,6 +42,7 @@ import {
   type RuntimeHandoffPause,
 } from './runtime-handoff.js';
 import {
+  hasMeaningfulMessageContent,
   isMessageContent,
   normalizeMessageContent,
   type MessageContent,
@@ -68,11 +70,8 @@ import {
   type OrchestrationMode,
 } from './orchestration.js';
 import { isToolMode, type ToolMode } from './tool-mode.js';
-import {
-  isRuntimeSystemNoteKind,
-  type PersistedBackendKind,
-  type RuntimeSystemNoteKind,
-} from './session.js';
+import { isExecutorId } from './executor-id.js';
+import { isSystemNoteKind, type PersistedBackendKind, type SystemNoteKind } from './session.js';
 import { decodeTurnOrigin, type TurnOrigin } from './turn-origin.js';
 import type { UserQuestionRequest } from './user-question.js';
 import {
@@ -180,6 +179,8 @@ export function isTerminalRuntimeEventStatus(value: unknown): boolean {
 
 export interface RuntimeEventTextContent extends MessageContent {
   kind: 'text';
+  /** Failed response fragment retained for display, never for model replay. */
+  interrupted?: true;
   /** Provider-owned text metadata such as Responses URL citations. */
   providerOptions?: Record<string, unknown>;
   /** Durable provenance for a host-authored user-role turn. */
@@ -239,7 +240,7 @@ export interface RuntimeEventFunctionResponseContent {
  */
 export interface RuntimeEventSystemNoteContent {
   kind: 'system_note';
-  note: RuntimeSystemNoteKind;
+  note: SystemNoteKind;
   /** Shape depends on `note`, exactly as it does on the transcript row. */
   data?: unknown;
 }
@@ -263,12 +264,21 @@ export interface RuntimeEventErrorContent {
 export type RuntimeInvocationRoute =
   | {
       provenance: 'runtime';
-      backendKind: PersistedBackendKind;
+      backendKind: Exclude<PersistedBackendKind, 'plugin-executor'>;
       llmConnectionId: string;
       llmConnectionSlug: string;
       modelId: string;
       /** Frozen provider endpoint and credential ownership; absent on non-provider runs. */
       providerStateIdentity?: `sha256:${string}`;
+    }
+  | {
+      provenance: 'runtime';
+      backendKind: 'plugin-executor';
+      executorId: string;
+      llmConnectionSlug: string;
+      modelId: string;
+      /** Frozen plugin package, entry point, and activation generation. */
+      providerStateIdentity: `sha256:${string}`;
     }
   | {
       provenance: 'unknown';
@@ -536,6 +546,8 @@ export interface RuntimeEventPermissionClosureAccepted {
  * event without `actions.endInvocation` MUST assert a terminal `status`.
  */
 export interface RuntimeEventActions {
+  /** Host coordination receipt linked to this admitted Run. */
+  coordination?: WorkHubActionReceipt;
   /** Durable physical pause; does not complete or cancel the owning logical Turn. */
   handoffPause?: RuntimeHandoffPause;
   /** Patch applied to invocation-scoped runtime state. */
@@ -720,6 +732,7 @@ const TEXT_CONTENT_SHAPE = defineObjectShape<RuntimeEventTextContent>()(
   ['kind', 'text'],
   [
     'displayText',
+    'interrupted',
     'origin',
     'attachments',
     'directoryReferences',
@@ -753,11 +766,24 @@ const INVOCATION_OPENED_CONTENT_SHAPE = defineObjectShape<RuntimeEventInvocation
   ['kind', 'protocol', 'route', 'configuration', 'root', 'source'],
   ['lineage'],
 );
-const INVOCATION_ROUTE_RUNTIME_SHAPE = defineObjectShape<
-  Extract<RuntimeInvocationRoute, { provenance: 'runtime' }>
+const INVOCATION_ROUTE_RUNTIME_MODEL_SHAPE = defineObjectShape<
+  Extract<RuntimeInvocationRoute, { provenance: 'runtime'; llmConnectionId: string }>
 >()(
   ['provenance', 'backendKind', 'llmConnectionId', 'llmConnectionSlug', 'modelId'],
   ['providerStateIdentity'],
+);
+const INVOCATION_ROUTE_RUNTIME_EXECUTOR_SHAPE = defineObjectShape<
+  Extract<RuntimeInvocationRoute, { provenance: 'runtime'; backendKind: 'plugin-executor' }>
+>()(
+  [
+    'provenance',
+    'backendKind',
+    'executorId',
+    'llmConnectionSlug',
+    'modelId',
+    'providerStateIdentity',
+  ],
+  [],
 );
 const INVOCATION_ROUTE_UNKNOWN_SHAPE = defineObjectShape<
   Extract<RuntimeInvocationRoute, { provenance: 'unknown' }>
@@ -838,6 +864,7 @@ const RUNTIME_ACTIONS_SHAPE = defineObjectShape<RuntimeEventActions>()(
   [],
   [
     'handoffPause',
+    'coordination',
     'stateDelta',
     'artifactDelta',
     'permissionRequest',
@@ -1041,6 +1068,7 @@ function isRuntimeEventContent(value: unknown): value is RuntimeEventContent {
         !hasExactShape(value, TEXT_CONTENT_SHAPE) ||
         (value.origin !== undefined && !isTurnOrigin(value.origin)) ||
         (value.steering !== undefined && value.steering !== true) ||
+        (value.interrupted !== undefined && value.interrupted !== true) ||
         (value.providerOptions !== undefined && !isRecord(value.providerOptions))
       ) {
         return false;
@@ -1097,7 +1125,7 @@ function isRuntimeEventContent(value: unknown): value is RuntimeEventContent {
       return (
         hasExactShape(value, SYSTEM_NOTE_CONTENT_SHAPE) &&
         typeof value.note === 'string' &&
-        isRuntimeSystemNoteKind(value.note)
+        isSystemNoteKind(value.note)
       );
     case 'invocation_opened':
       return isRuntimeInvocationOpened(value);
@@ -1148,8 +1176,15 @@ function isRuntimeInvocationRoute(value: unknown): value is RuntimeInvocationRou
     return false;
   }
   if (value.provenance === 'runtime') {
+    if (value.backendKind === 'plugin-executor') {
+      return (
+        hasExactShape(value, INVOCATION_ROUTE_RUNTIME_EXECUTOR_SHAPE) &&
+        isExecutorId(value.executorId) &&
+        isSha256Digest(value.providerStateIdentity)
+      );
+    }
     return (
-      hasExactShape(value, INVOCATION_ROUTE_RUNTIME_SHAPE) &&
+      hasExactShape(value, INVOCATION_ROUTE_RUNTIME_MODEL_SHAPE) &&
       isNonEmptyString(value.llmConnectionId) &&
       (value.providerStateIdentity === undefined || isSha256Digest(value.providerStateIdentity))
     );
@@ -1158,7 +1193,7 @@ function isRuntimeInvocationRoute(value: unknown): value is RuntimeInvocationRou
 }
 
 function isPersistedBackendKind(value: unknown): value is PersistedBackendKind {
-  return value === 'ai-sdk' || value === 'fake';
+  return value === 'ai-sdk' || value === 'plugin-executor' || value === 'fake';
 }
 
 function isRuntimeInvocationConfiguration(value: unknown): value is RuntimeInvocationConfiguration {
@@ -1272,6 +1307,7 @@ function isRuntimeEventActions(value: unknown): value is RuntimeEventActions {
   }
   return (
     (value.handoffPause === undefined || isRuntimeHandoffPause(value.handoffPause)) &&
+    (value.coordination === undefined || isWorkHubActionReceipt(value.coordination)) &&
     (value.stateDelta === undefined || isRecord(value.stateDelta)) &&
     (value.artifactDelta === undefined ||
       (isRecord(value.artifactDelta) &&
@@ -1553,7 +1589,10 @@ export function isPartialRuntimeEvent(event: RuntimeEvent): boolean {
 /**
  * True if the event carries content whose kind is eligible for model
  * history projection: text, thinking, function_call, or function_response.
- * Error-only content and pure action/refs events are NOT model-visible.
+ * A user-authored text event with structured context (quotes or attachments)
+ * is model-visible even when the inline text is empty — the structured part
+ * is what carries the turn (#4804). Error-only content and pure action/refs
+ * events are NOT model-visible.
  *
  * This is a content-kind check only. Callers still apply `partial`
  * filtering (partial chunks are never replayed into the next model call).
@@ -1564,7 +1603,7 @@ export function runtimeEventHasModelVisibleContent(event: RuntimeEvent): boolean
   if (!content) return false;
   switch (content.kind) {
     case 'text':
-      return content.text.length > 0;
+      return hasMeaningfulMessageContent(content);
     case 'thinking':
     case 'function_call':
     case 'function_response':

@@ -21,6 +21,7 @@ import { RetryError } from 'ai';
 import { MODEL_FAILURE_MESSAGE_MAX_BYTES } from '@maka/core/model-failure';
 import { truncateUtf8 } from '@maka/core/diagnostic-log';
 import { isAuthenticationErrorText } from '@maka/core/redaction';
+import type { ProviderRetryReason } from '@maka/core/events';
 import type { ModelFailure, ModelFailureKind } from './model-protocol.js';
 
 /**
@@ -52,6 +53,18 @@ const TRANSPORT_FAILURE_CODES: ReadonlySet<string> = new Set([
   'ENETUNREACH',
 ]);
 
+// A successful status acknowledges the headers, not a complete response body.
+// Unlike pre-response failures, require an explicit interruption code here:
+// neither SDK retryability nor arbitrary TLS/undici errors prove a transient cut.
+const RESPONSE_TRANSPORT_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ECONNABORTED',
+  'UND_ERR_SOCKET',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
 /**
  * xAI emits this code for transient model capacity failures, including when
  * the same payload is relayed through an OpenAI-compatible gateway. Do not
@@ -71,6 +84,8 @@ const PROVIDER_BILLING_PROVIDER_CODES: ReadonlySet<string> = new Set([
   'insufficient_quota', // OpenAI & OpenAI-compatible: error.code
   'insufficient_balance', // DeepSeek: error.code
   'quota_exceeded', // OpenAI-compatible variants: error.code
+  'freeusagelimiterror', // OpenCode Zen free tier exhausted (HTTP 429): error.type
+  'upgrade_required', // Command Code: the plan has no Provider API access (HTTP 403): error.code
 ]);
 
 /**
@@ -110,7 +125,7 @@ interface ProviderErrorEvidence {
   code: string;
   /** Structured provider identifiers (code/type), lowercased. */
   structuredCodes: string[];
-  /** Structured pre-response transport evidence from SDK metadata or cause codes. */
+  /** Structured transport evidence, including interruptions after successful headers. */
   transportFailure: boolean;
 }
 
@@ -140,11 +155,32 @@ interface ProviderFailureSummary {
 const PROVIDER_FAILURE_FIELD_MAX_BYTES = 256;
 
 const MAX_SAFE_TIMER_DELAY_MS = 2_147_483_647;
-const OPENAI_RESPONSES_WEBSOCKET_TRANSPORT_ERROR = 'OPENAI_RESPONSES_WEBSOCKET_TRANSPORT_ERROR';
-const RUNTIME_RETRYABLE_ERROR_CODES: ReadonlySet<string> = new Set([
-  OPENAI_RESPONSES_WEBSOCKET_TRANSPORT_ERROR,
+
+/** Codes the incremental Responses transport raises before any HTTP response. */
+const OPENAI_RESPONSES_TRANSPORT_CODES: ReadonlySet<string> = new Set([
+  'OPENAI_RESPONSES_WEBSOCKET_TRANSPORT_ERROR',
   'OPENAI_RESPONSES_CONTINUATION_UNAVAILABLE',
 ]);
+
+/** Retryability follows the kind alone; never re-derive it from a status or header. */
+const MODEL_FAILURE_RETRY: Record<ModelFailureKind, ProviderRetryReason | null> = {
+  abort: null,
+  auth: null,
+  context_overflow: null,
+  network: 'network',
+  provider_billing: null,
+  provider_capacity: 'provider_capacity',
+  provider_unavailable: 'provider_unavailable',
+  rate_limit: 'rate_limit',
+  request_rejected: null,
+  stream_truncated: 'stream_truncated',
+  timeout: 'timeout',
+  unknown: null,
+};
+
+export function providerRetryReason(kind: ModelFailureKind): ProviderRetryReason | null {
+  return MODEL_FAILURE_RETRY[kind];
+}
 
 function providerErrorTarget(error: unknown): unknown {
   return RetryError.isInstance(error) && error.lastError !== undefined && error.lastError !== error
@@ -153,10 +189,12 @@ function providerErrorTarget(error: unknown): unknown {
 }
 
 function isTransportFailure(target: unknown, statusCode: string): boolean {
-  if (statusCode) return false;
+  const successfulResponse = /^2\d\d$/.test(statusCode);
+  if (statusCode && !successfulResponse) return false;
   const record = objectRecord(target);
   if (!record) return false;
   if (
+    !successfulResponse &&
     target instanceof Error &&
     target.name === 'AI_APICallError' &&
     safeField(record, 'isRetryable') === true
@@ -170,13 +208,29 @@ function isTransportFailure(target: unknown, statusCode: string): boolean {
     seen.add(current);
     const currentRecord = objectRecord(current);
     if (!currentRecord) return false;
+    if (successfulResponse) {
+      const nestedStatus =
+        safeField(currentRecord, 'statusCode') ?? safeField(currentRecord, 'status');
+      // Do not reinterpret a cancellation or a nested HTTP rejection as a
+      // recoverable body interruption merely because it has a socket cause.
+      if (
+        safeField(currentRecord, 'name') === 'AbortError' ||
+        ((typeof nestedStatus === 'number' || typeof nestedStatus === 'string') &&
+          nestedStatus !== '' &&
+          !/^2\d\d$/.test(String(nestedStatus)))
+      ) {
+        return false;
+      }
+    }
     const code = safeField(currentRecord, 'code');
     if (
       typeof code === 'string' &&
-      (TRANSPORT_FAILURE_CODES.has(code) ||
-        code.startsWith('ERR_SSL_') ||
-        code.startsWith('ERR_TLS_') ||
-        code.startsWith('UND_ERR_'))
+      (successfulResponse
+        ? RESPONSE_TRANSPORT_FAILURE_CODES.has(code)
+        : TRANSPORT_FAILURE_CODES.has(code) ||
+          code.startsWith('ERR_SSL_') ||
+          code.startsWith('ERR_TLS_') ||
+          code.startsWith('UND_ERR_'))
     ) {
       return true;
     }
@@ -196,7 +250,7 @@ function responseHeadersFromError(error: unknown): Record<string, string> | unde
   return headers;
 }
 
-function parseRetryAfterMs(headers: Record<string, string>): number | null | undefined {
+function parseRetryAfterMs(headers: Record<string, string>): number | undefined {
   const rawMilliseconds = headers['retry-after-ms'];
   const rawRetryAfter = headers['retry-after'];
   if (rawMilliseconds === undefined && rawRetryAfter === undefined) return undefined;
@@ -208,7 +262,9 @@ function parseRetryAfterMs(headers: Record<string, string>): number | null | und
     const seconds = Number(rawRetryAfter);
     delayMs = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(rawRetryAfter!) - Date.now();
   }
-  if (!Number.isFinite(delayMs) || delayMs <= 0 || delayMs > MAX_SAFE_TIMER_DELAY_MS) return null;
+  if (!Number.isFinite(delayMs) || delayMs <= 0 || delayMs > MAX_SAFE_TIMER_DELAY_MS) {
+    return undefined;
+  }
   return Math.ceil(delayMs);
 }
 
@@ -217,39 +273,12 @@ function retryMetadataFromFacts(
   errorClass = classifyProviderFacts(facts),
 ): Pick<ModelFailure, 'retryable' | 'retryAfterMs'> {
   if (facts.aborted) return { retryable: false };
-  const { evidence } = facts;
-
-  if (RUNTIME_RETRYABLE_ERROR_CODES.has(evidence.code)) return { retryable: true };
   // The Codex transport already spent its complete 2/10/30-second budget.
   // Do not let the outer model loop restart that same transport budget.
   if (isTrustedCodexEdgeRejection(facts)) return { retryable: false };
-
-  const status = Number(evidence.statusCode || evidence.code);
+  if (MODEL_FAILURE_RETRY[errorClass] === null) return { retryable: false };
   const retryAfterMs = parseRetryAfterMs(facts.responseHeaders ?? {});
-  if (errorClass === 'provider_capacity') {
-    // Capacity is transient even when the provider sends a malformed delay;
-    // fall back to the adapter's bounded local backoff in that case.
-    return {
-      retryable: true,
-      ...(retryAfterMs !== undefined && retryAfterMs !== null ? { retryAfterMs } : {}),
-    };
-  }
-  if (errorClass === 'rate_limit' || status === 429) {
-    if (retryAfterMs === undefined || retryAfterMs === null) return { retryable: false };
-    return { retryable: true, retryAfterMs };
-  }
-  const retryable =
-    errorClass === 'network' ||
-    errorClass === 'provider_unavailable' ||
-    status === 408 ||
-    status === 409 ||
-    (status >= 500 && status <= 599);
-  if (!retryable) return { retryable: false };
-  if (retryAfterMs === null) return { retryable: false };
-  return {
-    retryable: true,
-    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-  };
+  return { retryable: true, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) };
 }
 
 /** Collects `code`/`type` strings from a payload and from its `error` wrapper. */
@@ -681,7 +710,9 @@ function classifyProviderFacts(facts: ProviderErrorFacts): ModelFailureKind {
   const { evidence } = facts;
   const { text, statusCode, code, structuredCodes } = evidence;
   const normalizedCode = code.toLowerCase();
-  if (code === OPENAI_RESPONSES_WEBSOCKET_TRANSPORT_ERROR) return 'network';
+  if (OPENAI_RESPONSES_TRANSPORT_CODES.has(code)) return 'network';
+  if (code === 'MODEL_STREAM_TIMEOUT') return 'timeout';
+  if (structuredCodes.includes('gateway_stream_terminated')) return 'stream_truncated';
   if (
     PROVIDER_CAPACITY_CODES.has(normalizedCode) ||
     structuredCodes.some((c) => PROVIDER_CAPACITY_CODES.has(c))
@@ -770,10 +801,15 @@ function isTrustedCodexEdgeRejection(facts: ProviderErrorFacts): boolean {
   const seen = new Set<unknown>();
   for (let depth = 0; depth < 5 && current !== undefined && !seen.has(current); depth += 1) {
     seen.add(current);
-    if (current instanceof Error && current.name === 'OpenAiCodexEdgeRejectionError') return true;
+    if (
+      current instanceof Error &&
+      safeField(current as unknown as Record<string, unknown>, 'name') ===
+        'OpenAiCodexEdgeRejectionError'
+    )
+      return true;
     current =
       typeof current === 'object' && current !== null
-        ? (current as { cause?: unknown }).cause
+        ? safeField(current as Record<string, unknown>, 'cause')
         : undefined;
   }
   return false;
