@@ -22,6 +22,7 @@ import test from 'node:test';
 import {
   catalogJobs,
   isExpectedConsoleError,
+  jobLabel,
   rescuedRenderSummary,
   storyUrl,
 } from './storybook-visual-smoke.mjs';
@@ -87,6 +88,27 @@ test('long system notes cover both locales at standard and narrow widths', () =>
       `colorScheme:light;palette:default;locale:${job.locale}`,
     );
   }
+});
+
+test('prompt rail clearance covers narrow, breakpoint and desktop viewports', () => {
+  const storyId =
+    'product-shell-official-appshell--prompt-rail-clears-user-messages-in-a-narrow-window';
+  const jobs = catalogJobs(storyIndex(storyId), { themePalettes: THEME_PALETTES });
+
+  assert.deepEqual(
+    jobs,
+    [720, 824, 825, 1280].map((width) => ({
+      storyId,
+      colorScheme: 'light',
+      forcedColors: 'none',
+      palette: 'default',
+      viewport: { width, height: 900 },
+    })),
+  );
+  assert.deepEqual(
+    jobs.map(jobLabel),
+    [720, 824, 825, 1280].map((width) => `${storyId} (light/default/${width}px)`),
+  );
 });
 
 test('forced-colors stories render under the forced palette', () => {

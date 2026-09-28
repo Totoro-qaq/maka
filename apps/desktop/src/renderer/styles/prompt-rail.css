@@ -39,14 +39,15 @@
   pointer-events: none;
 }
 
-/* Below a 750px window the rail would sit on the transcript (#5615). Once the
+/* Below an 825px window the rail would sit on the transcript (#5615). Once the
    reading column fills the scrollport, the room right of it is the transcript
    gutter (4vw) plus the message list's 16px inline padding, while the rail
-   takes 46px from the scrollport's edge: its 12px inset plus a 34px box.
-   4vw + 16px reaches 46px at 750px; narrower, the ticks and their hit area
-   cover the right edge of user messages. The quote companion hides its rail
+   takes up to 49px from the scrollport's edge: its 12px inset, a 34px box,
+   and the 3px inward hover movement. 4vw + 16px reaches 49px at 825px;
+   narrower, the ticks and their hit area cover the right edge of user messages.
+   The quote companion hides its rail
    the same way. */
-@media (max-width: 749px) {
+@media (width < 825px) {
   .maka-prompt-rail-host {
     display: none;
   }

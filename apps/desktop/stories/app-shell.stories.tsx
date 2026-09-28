@@ -3167,9 +3167,9 @@ export const PromptRailStaysInsideTheScrollport: Story = {
   },
 };
 
-// The Storybook smoke renders `narrow` stories in a 720px viewport. There the
-// reading column fills the scrollport and leaves less room on its right than
-// the rail takes from the scrollport's edge (#5615).
+// Real path: open a Session with history and resize the Desktop window. The
+// smoke runs this same state at 720, 824, 825 and 1280px, including native
+// pointer hover at the shown widths; the rail needs room for its whole hit box.
 export const PromptRailClearsUserMessagesInANarrowWindow: Story = {
   render: () => <PromptRailHarness />,
   play: async () => {
@@ -3186,9 +3186,15 @@ export const PromptRailClearsUserMessagesInANarrowWindow: Story = {
 
     const rail = document.querySelector('.maka-prompt-rail');
     if (!rail) throw new Error('the prompt rail is missing');
-    // A hidden rail has no box; a shown one must end before every bubble on its rows.
-    if (rail.getClientRects().length === 0) return;
+    if (window.innerWidth < 825) {
+      expect(rail.closest('.maka-prompt-rail-host')).toHaveStyle({ display: 'none' });
+      expect(rail).not.toBeVisible();
+      expect(rail.getClientRects()).toHaveLength(0);
+      return;
+    }
+    expect(rail).toBeVisible();
     const box = rail.getBoundingClientRect();
+    expect(box.width).toBeGreaterThan(0);
     expect(
       bubbles
         .filter((bubble) => bubble.bottom > box.top && bubble.top < box.bottom && bubble.right > box.left)
